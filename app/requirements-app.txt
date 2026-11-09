@@ -1,0 +1,8 @@
+# Dependensi KHUSUS aplikasi KISA (Windows). Dipakai untuk membangun KISA.exe.
+# Install di Windows (bukan di VM Linux ini):
+#     pip install -r app/requirements-app.txt
+# Dependensi server inti (psutil) sudah ada di requirements.txt.
+pywebview>=5.0
+pystray>=0.19
+pillow>=10.0
+pyinstaller>=6.0
