@@ -1365,13 +1365,17 @@ def _gsmtc_winrt():
     """
     global _WINRT_IMPORT_ERROR
     try:
-        from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+        try:
+            from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+            _np_debug["winrt"] = "ada (winsdk)"
+        except Exception:
+            from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+            _np_debug["winrt"] = "ada (winrt)"
     except Exception as e:
         _np_debug["winrt"] = "tidak ada"
         if not _WINRT_IMPORT_ERROR:
             _WINRT_IMPORT_ERROR = str(e)[:200]
         return None
-    _np_debug["winrt"] = "ada"
 
     async def _query():
         manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
@@ -1479,8 +1483,12 @@ def _gsmtc_thumbnail_winrt():
     jalan. Mengembalikan (bytes, content_type) atau (None, None).
     """
     try:
-        from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
-        from winrt.windows.storage.streams import DataReader
+        try:
+            from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+            from winsdk.windows.storage.streams import DataReader
+        except Exception:
+            from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+            from winrt.windows.storage.streams import DataReader
     except Exception:
         return None, None
 
