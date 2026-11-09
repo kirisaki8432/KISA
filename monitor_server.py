@@ -138,6 +138,7 @@ def _run_ps(cmd, timeout=4):
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", cmd],
             timeout=timeout, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         _last_ps_err["kind"] = ""
         return out or ""
@@ -161,6 +162,7 @@ def _run_ps_full(cmd, timeout=4):
             ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", cmd],
             timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return (p.stdout or "", p.stderr or "", p.returncode)
     except subprocess.TimeoutExpired:
@@ -180,6 +182,7 @@ def _run_ps_full_pwsh(cmd, timeout=15):
             ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
             timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return (p.stdout or "", p.stderr or "", p.returncode)
     except subprocess.TimeoutExpired:
