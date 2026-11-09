@@ -244,10 +244,11 @@ def open_window():
         import webview  # noqa: PLC0415
     except Exception:
         return False
-    icon = _resource_path("kisa.ico")
+    
     window = webview.create_window(
         APP_TITLE, URL, width=1280, height=800, resizable=True,
-        text_select=False, icon=icon if os.path.exists(icon) else None,
+        text_select=False,
+
     )
     try:
         webview.start()
