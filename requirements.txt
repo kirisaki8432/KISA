@@ -1,2 +1,3 @@
 psutil
 winsdk
+segno
