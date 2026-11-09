@@ -24,6 +24,21 @@
 # DULU di start_server(), baru pemanasan lambat (collect / firewall /
 # QR) menyusul di background — jendela tidak lagi menunggu puluhan
 # detik collect() pertama (cache dingin) sebelum port 8000 listen.
+# Patch 3.8 — pengaturan tersimpan (root cause TERBUKTI dari source
+# pywebview 6.2.1, BUKAN tebakan): webview.start() dipanggil TANPA argumen,
+# padahal default pywebview 6.x adalah private_mode=True (docstring start():
+# "In private mode, cookies and local storage are not preserved. Default is
+# True"). Akibatnya backend EdgeChromium mengaktifkan InPrivate WebView2
+# (edgechromium.py: props.set_IsInPrivateModeEnabled(_state['private_mode']))
+# DAN winforms.init_storage() memakai folder temp
+# (cache_dir = tempfile.TemporaryDirectory().name) bila private_mode True
+# tanpa storage_path — semua localStorage (preset tata letak, pengaturan)
+# terhapus tiap aplikasi ditutup total, walau sesi sudah lama. Perbaikan:
+# webview.start(private_mode=False, storage_path=<folder persisten eksplisit>)
+# dengan folder %LOCALAPPDATA%\KISA\WebView2 (stabil, tidak ikut terhapus
+# saat exe di-update; bukan _MEIPASS, bukan folder install). Pengujian nyata
+# (preset bertahan setelah Keluar lalu buka lagi) hanya bisa di PC user.
+#
 # Catatan jujur:
 # - Server KISA (monitor_server.py) TIDAK diubah: port 8000 hardcode,
 #   dashboard dibaca dari BASE_DIR server (folder aplikasi / _MEIPASS
@@ -320,6 +335,27 @@ def stop_tray():
 
 
 # ---------------------------------------------------------------- jendela
+def _webview_storage_path():
+    """Folder penyimpanan persisten untuk WebView2 (cookies + localStorage).
+
+    Patch 3.8: tanpa ini pywebview 6.2.1 memakai mode privat + folder temp
+    sehingga semua pengaturan hilang tiap aplikasi ditutup total.
+    Windows: %LOCALAPPDATA%\\KISA\\WebView2 (data lokal mesin, tidak roaming,
+    tidak ikut terhapus saat exe di-update). Lainnya: ~/.local/share/KISA/WebView2.
+    Folder dibuat bila belum ada; bila gagal dibuat, kembalikan None supaya
+    pywebview memakai default-nya (lebih baik daripada aplikasi tidak jalan)."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "share")
+    path = os.path.join(base, "KISA", "WebView2")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        return None
+    return path
+
+
 def open_window():
     """Buka dashboard di jendela aplikasi (pywebview). Kembalikan True bila
     jendela berhasil dibuka, False bila pywebview tidak tersedia.
@@ -344,7 +380,11 @@ def open_window():
     _window = window
     window.events.closing += _on_window_closing
     try:
-        webview.start()
+        # Patch 3.8: private_mode=False + storage_path eksplisit — tanpa ini
+        # pywebview 6.2.1 default private_mode=True (localStorage tidak
+        # tersimpan) dan folder user-data jatuh ke temp. Jangan ubah lagi
+        # ke webview.start() tanpa argumen.
+        webview.start(private_mode=False, storage_path=_webview_storage_path())
     except Exception:
         _window = None
         return False
