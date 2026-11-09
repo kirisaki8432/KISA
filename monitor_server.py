@@ -4116,7 +4116,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             html = (BASE_DIR / "dashboard.html").read_text(encoding="utf-8")
             self._send(html, "text/html; charset=utf-8")
-        elif self.path == "/qr.png":
+        elif self.path == "/qr.png" or self.path.startswith("/qr.png?"):
             _qr_ips = _local_ips()
             _qr_ip = _qr_ips[0] if _qr_ips else None
             if (not _QR_PNG.exists()) or (_qr_ip is not None and _qr_ip != _QR_IP):
