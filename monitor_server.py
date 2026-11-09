@@ -76,6 +76,7 @@ def _local_ips():
 
 
 _QR_PNG = BASE_DIR / "QR_Dashboard.png"
+_QR_IP = None  # IP LAN yang dipakai QR terakhir (untuk regenerasi live di /qr.png)
 
 
 def _dashboard_qr():
@@ -83,6 +84,8 @@ def _dashboard_qr():
     server mulai (IP bisa berubah bila DHCP ganti). Pakai segno (pure Python,
     tanpa dependensi). Gagal (segno belum ter-install / tidak ada IP LAN) ->
     peringatan saja, server tetap jalan tanpa QR. Kembalikan URL-nya, atau None."""
+    global _QR_IP
+    _QR_IP = None
     try:
         ips = _local_ips()
         if not ips:
@@ -95,6 +98,7 @@ def _dashboard_qr():
         scale = max(1, round(512 / (modules + 8)))
         qr.save(str(_QR_PNG), kind="png", scale=scale, border=4,
                 dark="black", light="white")
+        _QR_IP = ips[0]
         return url
     except ImportError:
         print("QR dashboard: library 'segno' belum ter-install — QR tidak dibuat.")
@@ -4113,12 +4117,27 @@ class Handler(BaseHTTPRequestHandler):
             html = (BASE_DIR / "dashboard.html").read_text(encoding="utf-8")
             self._send(html, "text/html; charset=utf-8")
         elif self.path == "/qr.png":
+            _qr_ips = _local_ips()
+            _qr_ip = _qr_ips[0] if _qr_ips else None
+            if (not _QR_PNG.exists()) or (_qr_ip is not None and _qr_ip != _QR_IP):
+                _dashboard_qr()
             if _QR_PNG.exists():
                 self._send(_QR_PNG.read_bytes(), "image/png")
             else:
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"No QR")
+        elif self.path == "/api/qr_url":
+            # Patch 3.5: kembalikan URL dashboard (IP LAN + PORT) sebagai JSON
+            # supaya popup QR di dashboard tidak perlu menebak alamat server.
+            _qru_ips = _local_ips()
+            _qru_ip = _qru_ips[0] if _qru_ips else None
+            if _qru_ip is not None and _qru_ip != _QR_IP:
+                _dashboard_qr()
+            if _qru_ip is not None:
+                self._send(json.dumps({"url": "http://%s:%d" % (_qru_ip, PORT)}), "application/json")
+            else:
+                self._send(json.dumps({"url": None}), "application/json")
         elif self.path == "/api/data" or self.path.startswith("/api/data?"):
             _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             _skip = set()
