@@ -1,4 +1,4 @@
-# kisa_app.py — Launcher aplikasi KISA (Patch 3.3, S138 Cara 3).
+# kisa_app.py — Launcher aplikasi KISA (Patch 3.5, tray minimize).
 #
 # Menjalankan server monitor KISA di dalam proses aplikasi (thread),
 # lalu membuka dashboard di jendela aplikasi sendiri (pywebview).
@@ -6,6 +6,24 @@
 # Ikon tray (pystray) + auto-start Windows bersifat opsional dan
 # semuanya dijaga try/except supaya aplikasi tetap jalan tanpa mereka.
 #
+# Patch 3.5 — tutup ke tray: tombol X pada jendela TIDAK keluar dari
+# aplikasi, melainkan menyembunyikan jendela ke tray (server tetap
+# jalan, ikon tray tetap ada). "Buka KISA" di menu tray menampilkan
+# lagi jendela; keluar yang sebenarnya hanya lewat "Keluar" di tray
+# (stop_server + stop tray + os._exit).
+# Dasar pywebview (v6.2.1, diverifikasi dari source wheel + docs resmi):
+# window.events.closing dibuat dengan should_lock=True, jadi
+# Event.set() menjalankan handler secara sinkron dan mengembalikan
+# True bila ada handler yang me-return False; backend WinForms
+# (on_closing) lalu mengeset args.Cancel = True. window.show() /
+# window.hide() dari thread lain di-marshal ke GUI thread lewat
+# Control.Invoke di backend WinForms, jadi aman dipanggil dari
+# thread menu tray.
+#
+# Patch 3.5 — startup cepat: server HTTP dibuat + serve_forever jalan
+# DULU di start_server(), baru pemanasan lambat (collect / firewall /
+# QR) menyusul di background — jendela tidak lagi menunggu puluhan
+# detik collect() pertama (cache dingin) sebelum port 8000 listen.
 # Catatan jujur:
 # - Server KISA (monitor_server.py) TIDAK diubah: port 8000 hardcode,
 #   dashboard dibaca dari BASE_DIR server (folder aplikasi / _MEIPASS
@@ -15,6 +33,8 @@
 #   Jendela aplikasi menampilkan dashboard langsung, jadi QR tidak wajib.
 # - Jendela pywebview TIDAK bisa diuji di VM Linux tanpa display; yang
 #   teruji di sini adalah jalur start server + tunggu server siap.
+# - Menutup jendela (X) hanya menyembunyikannya ke tray; webview.start()
+#   tetap blocking dan aplikasi baru berhenti lewat "Keluar" di tray.
 
 import argparse
 import os
@@ -34,6 +54,7 @@ URL = f"http://127.0.0.1:{PORT}"
 _server = None          # ThreadingHTTPServer yang sedang jalan
 _server_thread = None
 _tray_icon = None
+_window = None          # Window pywebview yang sedang jalan (None: belum dibuat / mode --tray / fallback browser)
 
 
 def _app_dir():
@@ -61,9 +82,26 @@ def _exe_path():
 
 # ---------------------------------------------------------------- server
 def start_server():
-    """Jalankan server monitor KISA di thread daemon. Meniru blok __main__
-    monitor_server.py (cpu_percent, collect, power thread, HTTP server)."""
+    """Jalankan server monitor KISA di thread daemon.
+
+    Patch 3.5 — startup cepat: urutan dibalik dari blok __main__
+    monitor_server.py. DULU: cpu_percent + collect() + firewall + QR
+    dulu, baru ThreadingHTTPServer dibuat dan serve_forever jalan —
+    padahal collect() pertama (semua cache dingin) memanggil belasan
+    PowerShell / CIM / GSMTC / LHM berurutan dan bisa makan puluhan
+    detik sebelum port 8000 listen, sementara main() menunggu HTTP 200
+    di wait_for_server(). SEKARANG: server dibuat + serve_forever
+    jalan DULU (port langsung listen, GET / langsung menjawab
+    dashboard.html statis tanpa collect), baru sesudahnya pemanasan
+    lambat (collect, power thread, firewall, QR) jalan di thread yang
+    sama sebagai background — jendela tidak lagi menunggu mereka.
+    GET /api/data pertama tetap memanggil collect() seperti biasa
+    (di thread request), jadi data menyusul begitu pemanasan selesai.
+    Perilaku lain tidak berubah: tray minimize, mode --tray, dan
+    fallback browser tetap seperti semula."""
     global _server, _server_thread
+    if _server is not None:
+        return _server
     if _server_thread is not None and _server_thread.is_alive():
         return _server
 
@@ -71,6 +109,19 @@ def start_server():
 
     def _run():
         global _server
+        # 1. Listen DULU — ini satu-satunya yang ditunggu main() /
+        #    wait_for_server() sebelum jendela dibuka. Tanpa ini,
+        #    semua langkah lambat di bawah memblokir jendela.
+        try:
+            _server = ThreadingHTTPServer(("0.0.0.0", ms.PORT), ms.Handler)
+        except Exception as e:
+            print("KISA: gagal membuka port", ms.PORT, "-", e)
+            return
+        threading.Thread(target=_server.serve_forever, daemon=True,
+                         name="kisa-http").start()
+        # 2. Pemanasan lambat, SESUDAH listen (background). Urutan sama
+        #    seperti blok __main__ monitor_server.py, hanya dipindah ke
+        #    belakang serve_forever — masing-masing sudah try/except.
         try:
             ms.psutil.cpu_percent(interval=0.1)
         except Exception:
@@ -83,7 +134,6 @@ def start_server():
             threading.Thread(target=ms._power_thread, daemon=True).start()
         except Exception:
             pass
-        _server = ThreadingHTTPServer(("0.0.0.0", ms.PORT), ms.Handler)
         try:
             ms._ensure_firewall_rule()
         except Exception:
@@ -92,10 +142,8 @@ def start_server():
             ms._dashboard_qr()
         except Exception:
             pass
-        try:
-            _server.serve_forever()
-        except Exception:
-            pass
+        # serve_forever jalan di thread kisa-http sendiri; thread _run
+        # selesai di sini setelah pemanasan, server tetap jalan.
 
     _server_thread = threading.Thread(target=_run, daemon=True, name="kisa-server")
     _server_thread.start()
@@ -184,6 +232,41 @@ def _open_in_browser():
     webbrowser.open(URL)
 
 
+def _open_kisa_window(icon=None, item=None):
+    """Menu tray "Buka KISA": tampilkan lagi jendela aplikasi bila ada,
+    kalau tidak ada jendela (mode --tray, atau pywebview gagal) fallback
+    ke browser. Dipanggil dari thread menu tray; window.show() di-marshal
+    ke GUI thread oleh backend WinForms pywebview (Control.Invoke), dan
+    dibungkus try/except supaya galatnya tidak mematikan thread tray."""
+    global _window
+    window = _window
+    if window is not None:
+        try:
+            window.show()
+            return
+        except Exception:
+            pass
+    _open_in_browser()
+
+
+def _on_window_closing():
+    """Handler window.events.closing: sembunyikan jendela ke tray dan
+    VETO penutupan (return False). Dipanggil sinkron di GUI thread oleh
+    pywebview (closing dibuat dengan should_lock=True); return False
+    membuat backend WinForms mengeset args.Cancel = True sehingga
+    jendela tidak dihancurkan dan webview.start() tetap blocking.
+    Selalu return False, juga bila hide() gagal — jendela tetap tampil
+    daripada aplikasi mati diam-diam; keluar hanya lewat "Keluar"."""
+    global _window
+    window = _window
+    if window is not None:
+        try:
+            window.hide()
+        except Exception:
+            pass
+    return False
+
+
 def _quit_app(icon=None, item=None):
     stop_server()
     try:
@@ -207,7 +290,7 @@ def start_tray():
         set_autostart(not get_autostart())
 
     menu = Menu(
-        MenuItem("Buka KISA", lambda icon, item: _open_in_browser()),
+        MenuItem("Buka KISA", _open_kisa_window),
         MenuItem("Buka di Browser", lambda icon, item: _open_in_browser()),
         MenuItem(
             "Jalankan saat Windows nyala",
@@ -239,21 +322,35 @@ def stop_tray():
 # ---------------------------------------------------------------- jendela
 def open_window():
     """Buka dashboard di jendela aplikasi (pywebview). Kembalikan True bila
-    jendela berhasil dibuka, False bila pywebview tidak tersedia."""
+    jendela berhasil dibuka, False bila pywebview tidak tersedia.
+    Menutup jendela (X) TIDAK mengakhiri aplikasi: handler closing
+    mem-veto penutupan dan menyembunyikan jendela ke tray, jadi
+    webview.start() di bawah tetap blocking sampai jendela benar-benar
+    dihancurkan atau proses dimatikan lewat "Keluar" di tray."""
+    global _window
     try:
         import webview  # noqa: PLC0415
     except Exception:
         return False
-    
-    window = webview.create_window(
-        APP_TITLE, URL, width=1280, height=800, resizable=True,
-        text_select=False,
 
-    )
+    try:
+        window = webview.create_window(
+            APP_TITLE, URL, width=1280, height=800, resizable=True,
+            text_select=False,
+
+        )
+    except Exception:
+        return False
+    _window = window
+    window.events.closing += _on_window_closing
     try:
         webview.start()
     except Exception:
+        _window = None
         return False
+    # GUI loop benar-benar berakhir (jendela dihancurkan): tidak ada lagi
+    # window yang bisa ditampilkan dari tray.
+    _window = None
     return True
 
 
@@ -284,7 +381,10 @@ def main(argv=None):
 
     if not args.tray:
         if open_window():
-            # Jendela ditutup user -> keluar dengan rapi.
+            # GUI loop berakhir (jendela benar-benar dihancurkan) -> keluar
+            # dengan rapi. Catatan: tombol X biasa TIDAK sampai ke sini —
+            # handler closing mem-veto dan menyembunyikan jendela ke tray,
+            # jadi webview.start() tetap blocking dan tray tetap hidup.
             stop_tray()
             stop_server()
             return 0
