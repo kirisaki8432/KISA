@@ -1,8 +1,11 @@
 package com.kirisaki.kisa
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
@@ -11,8 +14,10 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 
 /**
  * Wrapper WebView KISA (Patch 3.3, S138 Cara 3).
@@ -20,6 +25,7 @@ import androidx.appcompat.app.AppCompatActivity
  * Aplikasi ini TIDAK memonitor HP — ia membuka dashboard server KISA yang
  * jalan di PC lewat Wi-Fi yang sama. Alamat server (mis. http://192.168.1.10:8000)
  * dimasukkan sekali, lalu disimpan. Menu "Ubah alamat server" untuk ganti PC.
+ * Alamat juga bisa diisi dengan scan QR code dashboard (tombol "Scan QR").
  */
 class MainActivity : AppCompatActivity() {
 
@@ -30,6 +36,33 @@ class MainActivity : AppCompatActivity() {
         private const val PREFS = "kisa"
         private const val KEY_URL = "dashboard_url"
         private const val DEFAULT_HINT = "http://192.168.1.10:8000"
+    }
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchScanner()
+        } else {
+            Toast.makeText(this, "Izin kamera diperlukan untuk scan QR.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val scanLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val url = result.data?.getStringExtra(ScanActivity.EXTRA_URL)?.trim()
+            if (!url.isNullOrBlank() &&
+                (url.startsWith("http://") || url.startsWith("https://"))
+            ) {
+                prefs.edit().putString(KEY_URL, url).apply()
+                webView.loadUrl(url)
+            } else {
+                Toast.makeText(this, "QR tidak berisi alamat dashboard.", Toast.LENGTH_SHORT).show()
+                askForAddress()
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -61,13 +94,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun requestCameraAndScan() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            launchScanner()
+        } else {
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun launchScanner() {
+        scanLauncher.launch(Intent(this, ScanActivity::class.java))
+    }
+
     private fun askForAddress() {
         val input = EditText(this)
         input.hint = DEFAULT_HINT
         input.setText(prefs.getString(KEY_URL, "") ?: "")
         AlertDialog.Builder(this)
             .setTitle("Alamat server KISA")
-            .setMessage("Masukkan alamat dashboard di PC (satu Wi-Fi yang sama), contoh: http://192.168.1.10:8000")
+            .setMessage("Masukkan alamat dashboard di PC (satu Wi-Fi yang sama), contoh: http://192.168.1.10:8000 — atau scan QR code dashboard.")
             .setView(input)
             .setPositiveButton("Hubungkan") { _, _ ->
                 val url = input.text.toString().trim()
@@ -78,6 +125,7 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit().putString(KEY_URL, url).apply()
                 webView.loadUrl(url)
             }
+            .setNeutralButton("Scan QR") { _, _ -> requestCameraAndScan() }
             .setNegativeButton("Batal", null)
             .show()
     }
