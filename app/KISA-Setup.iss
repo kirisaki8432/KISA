@@ -37,7 +37,7 @@ WizardStyle=modern
 LicenseFile=..\LICENSE
 
 [Languages]
-Name: "indonesian"; MessagesFile: "compiler:Languages\Indonesian.isl"
+
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
