@@ -39,6 +39,42 @@
 # saat exe di-update; bukan _MEIPASS, bukan folder install). Pengujian nyata
 # (preset bertahan setelah Keluar lalu buka lagi) hanya bisa di PC user.
 #
+# Patch 3.9 — jendela & taskbar & keluar & startup (BUKTI dari source,
+# bukan tebakan):
+# - (2) Jendela di tengah: create_window() tanpa x/y memakai
+#   FormStartPosition.CenterScreen (WinForms), TAPI ukuran jendela dihitung
+#   dalam piksel FISIK (int(width*scale), Dpi-aware) sementara CenterScreen
+#   memusatkan pada batas layar penuh (taskbar tidak dikecualikan) — bila
+#   DPI bukan 100%, jendela bisa lebih besar dari layar logis dan mendarat
+#   rendah/terpotong bawah (laporan user). Perbaikan: posisi dihitung
+#   eksplisit dari WorkingArea layar utama (webview.screens, frame =
+#   area kerja tanpa taskbar), dijepit agar 1280x800 selalu muat.
+# - (3) Ikon K ganda: pywebview 6.2.1 TIDAK menyetel AppUserModelID sama
+#   sekali (grep source: 0 hasil) — jendela mendapat AppUserModelID default
+#   Windows, sementara shortcut installer memakai AppId dari KISA-Setup.iss
+#   — dua ID berbeda = Windows menampilkan ikon pin + ikon jendela sebagai
+#   DUA ikon taskbar. Perbaikan: SetCurrentProcessExplicitAppUserModelID
+#   dengan nilai yang SAMA dengan AppId .iss, sebelum jendela dibuat.
+#   AppId di .iss TIDAK berubah.
+# - (3)+(7) Single-instance: TIDAK ADA mutex di 3.8. Instance kedua: gagal
+#   bind port 8000 (diam-diam), TAPI wait_for_server() tetap sukses karena
+#   server instance pertama menjawab — lalu instance kedua membuka jendela
+#   + ikon tray KEDUA, dan klik ikon taskbar yang meluncurkan instance
+#   kedua tidak memunculkan apa-apa. Perbaikan: named mutex + named event;
+#   instance kedua menyinyal instance pertama (tampilkan jendela ke depan)
+#   lalu keluar — tanpa instance/server kedua.
+# - (4) Keluar lambat: shutdown kini bertahap DENGAN BATAS WAKTU — watchdog
+#   2 detik memaksa os._exit(0); jendela ditutup dulu (WebView2 flush,
+#   perbaikan 3.8 terjaga) lewat destroy() dengan flag _QUITTING yang
+#   melewati veto tray; baru server + tray dimatikan.
+# - (5) Buka lambat: peluncuran kedua kini fast-path (mutex -> sinyal ->
+#   keluar, tanpa server/WebView2 baru). Peluncuran PERTAMA masih dibatasi
+#   ekstraksi onefile PyInstaller + cold-start WebView2 (bawaan packaging /
+#   runtime, bukan kode ini) — perbaikan 3.5 (listen-first) dipertahankan;
+#   opsi lanjutan onedir TIDAK dibangun di 3.9.
+# Bukti visual (tengah/tidak terpotong, 1 ikon, Keluar cepat, buka cepat)
+# HANYA bisa di PC user.
+#
 # Catatan jujur:
 # - Server KISA (monitor_server.py) TIDAK diubah: port 8000 hardcode,
 #   dashboard dibaca dari BASE_DIR server (folder aplikasi / _MEIPASS
@@ -65,6 +101,21 @@ APP_NAME = "KISA"
 APP_TITLE = "KISA"
 PORT = 8000
 URL = f"http://127.0.0.1:{PORT}"
+
+# Patch 3.9 (item 3): HARUS sama persis dengan AppId di app/KISA-Setup.iss
+# (di .iss ditulis {{3F2A1B4C-...}} karena kurung kurawal di-escape Inno
+# Setup; nilai sebenarnya satu kurung kurawal). AppId .iss TIDAK berubah.
+APP_USER_MODEL_ID = "{3F2A1B4C-9D8E-4A7F-B123-4C5D6E7F8091}"
+
+# Patch 3.9 (item 3+7): single-instance — nama mutex/event (session-local,
+# tanpa butuh hak admin; awalan "Global\" sengaja TIDAK dipakai).
+_SINGLE_MUTEX_NAME = "KISA_SingleInstance_3F2A1B4C"
+_SHOW_EVENT_NAME = "KISA_ShowWindow_3F2A1B4C"
+_single_mutex = None
+_single_event = None
+
+_QUITTING = threading.Event()          # Patch 3.9 (item 4): sedang Keluar
+_show_window_requested = threading.Event()  # Patch 3.9 (item 7): tampilkan jendela
 
 _server = None          # ThreadingHTTPServer yang sedang jalan
 _server_thread = None
@@ -93,6 +144,128 @@ def _exe_path():
     if getattr(sys, "frozen", False):
         return sys.executable
     return ""
+
+
+# ------------------------------------------------------- Patch 3.9: jendela & taskbar
+def _set_app_user_model_id():
+    """Set AppUserModelID proses agar SAMA dengan shortcut installer.
+
+    Patch 3.9 (item 3). Windows saja; di OS lain no-op. Dipanggil di awal
+    main(), sebelum jendela dibuat — SetCurrentProcessExplicitAppUserModelID
+    harus dipanggil sebelum jendela pertama dibuat agar berlaku untuknya.
+    Kegagalan di sini tidak boleh menghentikan aplikasi (try/except)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes  # noqa: PLC0415 - Windows saja
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def _acquire_single_instance():
+    """Single-instance (Patch 3.9, item 3 + 7). Windows saja.
+
+    Kembalikan True bila proses ini instance PERTAMA (lanjut jalan normal),
+    False bila sudah ada instance lain — dalam hal itu instance pertama
+    disinyal lewat named event untuk memunculkan jendelanya, lalu proses
+    ini keluar (tanpa server/jendela/tray kedua). Handle mutex disimpan di
+    global agar tetap terkunci selama proses hidup. Bila mutex gagal dibuat
+    (bukan karena sudah ada), kembalikan True supaya aplikasi tetap jalan."""
+    global _single_mutex, _single_event
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes  # noqa: PLC0415 - Windows saja
+        kernel32 = ctypes.windll.kernel32
+        mutex = kernel32.CreateMutexW(None, True, _SINGLE_MUTEX_NAME)
+        err = kernel32.GetLastError()
+        if err == 183:  # ERROR_ALREADY_EXISTS - instance lain sudah jalan
+            try:
+                ev = kernel32.OpenEventW(0x0002, False, _SHOW_EVENT_NAME)  # EVENT_MODIFY_STATE
+                if ev:
+                    kernel32.SetEvent(ev)
+                    kernel32.CloseHandle(ev)
+            except Exception:
+                pass
+            try:
+                if mutex:
+                    kernel32.CloseHandle(mutex)
+            except Exception:
+                pass
+            return False
+        _single_mutex = mutex
+        _single_event = kernel32.CreateEventW(None, False, False, _SHOW_EVENT_NAME)
+        threading.Thread(target=_single_instance_watcher, daemon=True, name="kisa-single").start()
+        return True
+    except Exception:
+        return True
+
+
+def _single_instance_watcher():
+    """Tunggu sinyal 'tampilkan jendela' dari instance kedua, lalu tampilkan.
+
+    Jalan di thread daemon; WaitForSingleObject(INFINITE) pada event
+    auto-reset. Bila ada jendela, window.show() (di-marshal ke GUI thread
+    oleh backend WinForms: Show + Activate). Bila belum ada jendela (mode
+    --tray), _show_window_requested membuat loop utama main() membukanya."""
+    if os.name != "nt" or _single_event is None:
+        return
+    try:
+        import ctypes  # noqa: PLC0415 - Windows saja
+        kernel32 = ctypes.windll.kernel32
+        while True:
+            if kernel32.WaitForSingleObject(_single_event, 0xFFFFFFFF) == 0:
+                _show_window_requested.set()
+                window = _window
+                if window is not None:
+                    try:
+                        window.show()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _centered_window_geometry(width, height):
+    """Hitung (x, y, w, h) agar jendela terbuka DI TENGAH layar utama.
+
+    Patch 3.9 (item 2). Sumber: webview.screens (pywebview 6.2.1,
+    __init__.py:513-521 — module property yang menginisialisasi guilib bila
+    perlu, aman dipanggil sebelum webview.start()). Tiap Screen membawa
+    x/y/width/height logis (Bounds) + frame = WorkingArea (tanpa taskbar,
+    winforms.py get_screens()). Dipakai frame bila ada, kalau tidak Bounds.
+    Layar utama = yang memuat titik (0,0); kalau tidak ada, screens[0].
+    Ukuran dijepit ke area kerja supaya jendela 1280x800 selalu muat
+    sepenuhnya (tidak terpotong bawah) di layar apa pun. x/y yang
+    dikembalikan dalam piksel LOGIS — satuan yang dipakai pywebview untuk
+    x/y create_window (backend WinForms mengalikan lagi dengan scale DPI
+    saat menaruh jendela, winforms.py ~214-229). Gagal apa pun ->
+    (None, None, width, height) = perilaku CenterScreen lama."""
+    try:
+        import webview  # noqa: PLC0415
+        screens = webview.screens
+        scr = None
+        for s in screens:
+            if s.x == 0 and s.y == 0:
+                scr = s
+                break
+        if scr is None and screens:
+            scr = screens[0]
+        if scr is not None:
+            frame = getattr(scr, "frame", None)
+            if frame is not None and getattr(frame, "Width", 0) and getattr(frame, "Height", 0):
+                ax, ay, aw, ah = int(frame.X), int(frame.Y), int(frame.Width), int(frame.Height)
+            else:
+                ax, ay, aw, ah = int(scr.x), int(scr.y), int(scr.width), int(scr.height)
+            w = min(int(width), aw)
+            h = min(int(height), ah)
+            x = ax + max(0, (aw - w) // 2)
+            y = ay + max(0, (ah - h) // 2)
+            return (x, y, w, h)
+    except Exception:
+        pass
+    return (None, None, width, height)
 
 
 # ---------------------------------------------------------------- server
@@ -261,6 +434,14 @@ def _open_kisa_window(icon=None, item=None):
             return
         except Exception:
             pass
+    # Patch 3.9 (item 7): tidak ada jendela (mode --tray) — minta loop utama
+    # main() membukanya. Beri waktu sekejap; bila jendela tetap tidak ada
+    # (pywebview tidak tersedia), fallback ke browser seperti semula.
+    _show_window_requested.set()
+    for _ in range(10):
+        time.sleep(0.1)
+        if _window is not None:
+            return
     _open_in_browser()
 
 
@@ -271,7 +452,12 @@ def _on_window_closing():
     membuat backend WinForms mengeset args.Cancel = True sehingga
     jendela tidak dihancurkan dan webview.start() tetap blocking.
     Selalu return False, juga bila hide() gagal — jendela tetap tampil
-    daripada aplikasi mati diam-diam; keluar hanya lewat "Keluar"."""
+    daripada aplikasi mati diam-diam; keluar hanya lewat "Keluar".
+    Patch 3.9 (item 4): bila _QUITTING set (Keluar dari tray), kembalikan
+    True — penutupan DIIZINKAN supaya jendela dihancurkan dan WebView2
+    sempat flush penyimpanan (perbaikan 3.8 tetap terjaga)."""
+    if _QUITTING.is_set():
+        return True
     global _window
     window = _window
     if window is not None:
@@ -283,10 +469,35 @@ def _on_window_closing():
 
 
 def _quit_app(icon=None, item=None):
+    """Keluar dari tray (Patch 3.9, item 4 — shutdown bertahap + batas waktu).
+
+    Dulu: stop_server() -> icon.stop() -> os._exit(0). Lambatnya bisa dari
+    server.shutdown() yang menunggu, atau icon.stop() (pystray) yang
+    dipanggil dari thread menu. Sekarang: (1) watchdog 2 detik yang memaksa
+    os._exit(0) apa pun yang terjadi — Keluar tidak pernah lebih dari
+    ~2 detik; (2) tutup jendela DULU lewat destroy() dengan _QUITTING set
+    (melewati veto tray, jadi WebView2 flush localStorage — perbaikan 3.8
+    tetap terjaga); (3) tunggu sebentar sampai GUI loop selesai (maks 1
+    detik); (4) matikan server + tray; (5) os._exit(0)."""
+    _wd = threading.Timer(2.0, lambda: os._exit(0))
+    _wd.daemon = True
+    _wd.start()
+    _QUITTING.set()
+    window = _window
+    if window is not None:
+        try:
+            window.destroy()
+        except Exception:
+            pass
+        deadline = time.time() + 1.0
+        while time.time() < deadline and _window is not None:
+            time.sleep(0.05)
     stop_server()
     try:
         if icon is not None:
             icon.stop()
+        elif _tray_icon is not None:
+            _tray_icon.stop()
     except Exception:
         pass
     os._exit(0)
@@ -369,11 +580,14 @@ def open_window():
     except Exception:
         return False
 
+    # Patch 3.9 (item 2): posisi dihitung eksplisit agar jendela terbuka
+    # DI TENGAH layar utama dan selalu muat (tidak terpotong bawah).
+    # (None, None) bila gagal dihitung = CenterScreen seperti semula.
+    _gx, _gy, _gw, _gh = _centered_window_geometry(1280, 800)
     try:
         window = webview.create_window(
-            APP_TITLE, URL, width=1280, height=800, resizable=True,
-            text_select=False,
-
+            APP_TITLE, URL, width=_gw, height=_gh, x=_gx, y=_gy,
+            resizable=True, text_select=False,
         )
     except Exception:
         return False
@@ -411,6 +625,14 @@ def main(argv=None):
         print("Auto-start dihapus:", "OK" if set_autostart(False) else "gagal / bukan Windows")
         return 0
 
+    # Patch 3.9 (item 3+7): AppUserModelID + single-instance, SEBELUM
+    # server/jendela. Instance kedua: sinyal instance pertama untuk
+    # menampilkan jendelanya, lalu keluar — tanpa server/jendela kedua.
+    _set_app_user_model_id()
+    if not _acquire_single_instance():
+        print("KISA: sudah berjalan — menampilkan jendela yang ada.")
+        return 0
+
     start_server()
     if not wait_for_server(timeout=30.0):
         print("KISA: server tidak menjawab di", URL)
@@ -433,9 +655,20 @@ def main(argv=None):
 
     # Mode tray / fallback: jalan sampai user memilih Keluar dari tray
     # (atau Ctrl+C bila dijalankan dari terminal).
+    # Patch 3.9 (item 7): loop ini juga melayani permintaan tampilkan
+    # jendela — klik ikon taskbar / desktop / Start menu saat instance
+    # sudah jalan di tray, atau menu tray "Buka KISA" saat belum ada
+    # jendela. Tanpa ini, peluncuran kedua hanya diam (item 7).
     try:
         while True:
-            time.sleep(3600)
+            if _show_window_requested.wait(timeout=0.5):
+                _show_window_requested.clear()
+                if open_window():
+                    # GUI loop berakhir (jendela dihancurkan saat Keluar)
+                    stop_tray()
+                    stop_server()
+                    return 0
+                _open_in_browser()
     except KeyboardInterrupt:
         pass
     finally:
