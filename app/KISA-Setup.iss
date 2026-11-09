@@ -1,8 +1,8 @@
-; KISA-Setup.iss — Installer KISA (Patch 3.3, S138 Cara 3) untuk Inno Setup 6.
+; KISA-Setup.iss — Installer KISA (Patch 3.8, S138 Cara 3) untuk Inno Setup 6.
 ; Dijalankan SETELAH PyInstaller membuat dist\KISA.exe:
 ;     pyinstaller app\KISA.spec
 ;     iscc app\KISA-Setup.iss
-; Hasil: dist-installer\KISA-Setup-3.3.exe
+; Hasil: dist-installer\KISA-Setup-3.8.exe
 ;
 ; Catatan:
 ; - KISA.exe (onefile) sudah berisi Python + server + dashboard; installer
@@ -13,7 +13,7 @@
 ; - Auto-start Windows diatur aplikasi sendiri (tray menu / --install-autostart).
 
 #define MyAppName "KISA"
-#define MyAppVersion "3.3"
+#define MyAppVersion "3.8"
 #define MyAppPublisher "kirisaki"
 #define MyAppExeName "KISA.exe"
 
