@@ -23,7 +23,7 @@ block_cipher = None
 
 a = Analysis(
     [os.path.join(SPECPATH_DIR, "kisa_app.py")],
-    pathex=[SPECPATH_DIR],
+    pathex=[SPECPATH_DIR, ROOT],
     binaries=[],
     datas=[
         (os.path.join(ROOT, "dashboard.html"), "."),
@@ -33,6 +33,7 @@ a = Analysis(
         (os.path.join(SPECPATH_DIR, "icons", "kisa-192.png"), "."),
     ],
     hiddenimports=[
+        "monitor_server",
         "psutil",
         "segno",
         "winrt",
