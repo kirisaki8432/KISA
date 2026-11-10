@@ -589,6 +589,22 @@ def _webview_storage_path():
     return path
 
 
+class _JsApi:
+    """Bridge JS untuk dashboard (Patch 4.7, S145 Cara 1): fullscreen asli
+    di jendela aplikasi. pywebview tidak mengurus Fullscreen API browser,
+    jadi dashboard memanggil window.pywebview.api.toggle_fullscreen().
+    Dipanggil dari thread JS pywebview; window.toggle_fullscreen() adalah
+    pola yang didokumentasikan pywebview untuk js_api."""
+
+    def toggle_fullscreen(self):
+        try:
+            w = _window
+            if w is not None:
+                w.toggle_fullscreen()
+        except Exception:
+            pass
+
+
 def open_window():
     """Buka dashboard di jendela aplikasi (pywebview). Kembalikan True bila
     jendela berhasil dibuka, False bila pywebview tidak tersedia.
@@ -606,10 +622,11 @@ def open_window():
     # DI TENGAH layar utama dan selalu muat (tidak terpotong bawah).
     # (None, None) bila gagal dihitung = CenterScreen seperti semula.
     _gx, _gy, _gw, _gh = _centered_window_geometry(1280, 800)
+    _js_api = _JsApi()
     try:
         window = webview.create_window(
             APP_TITLE, URL, width=_gw, height=_gh, x=_gx, y=_gy,
-            resizable=True, text_select=False,
+            resizable=True, text_select=False, js_api=_js_api,
         )
     except Exception:
         return False
