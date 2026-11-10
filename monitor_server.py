@@ -50,7 +50,7 @@ PORT = 8000
 # Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
 # /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
 # Naikkan tiap patch (bersamaan dengan footer dashboard).
-KISA_VERSION = "4.6"
+KISA_VERSION = "4.7"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
@@ -2921,6 +2921,49 @@ def _upd_github_latest():
         return None
 
 
+def _upd_releases_page_latest():
+    """Jalur cadangan (Patch 4.7, S161 Cara 2): baca halaman rilis GitHub
+    biasa bila API (api.github.com) gagal — halaman ini tidak kena batas
+    API. Ikut redirect ke /releases/tag/vX.Y, lalu bentuk dict yang SAMA
+    persis seperti hasil API (tag_name, name, body, assets) supaya loop
+    aset di _update_check bisa dipakai ulang. Nama aset mengikuti aturan
+    penamaan (KISA-Setup-X.Y.exe, KISA-X.Y.apk); size 0 bila tidak
+    diketahui. Kembalikan None bila gagal."""
+    try:
+        req = urllib.request.Request(
+            "https://github.com/kirisaki8432/KISA/releases/latest",
+            headers={"User-Agent": "KISA-Updater"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final_url = resp.geturl()
+            html = resp.read().decode("utf-8", "ignore")
+        tag = ""
+        m = re.search(r"/releases/tag/(v[0-9][0-9A-Za-z.\-]*)", final_url)
+        if m:
+            tag = m.group(1)
+        if not tag:
+            m2 = re.search(r"/kirisaki8432/KISA/releases/tag/(v[0-9][0-9A-Za-z.\-]*)", html)
+            if m2:
+                tag = m2.group(1)
+        if not tag:
+            return None
+        latest = tag[1:] if tag[:1].lower() == "v" else tag
+        assets = []
+        for name in ("KISA-Setup-" + latest + ".exe", "KISA-" + latest + ".apk"):
+            assets.append({
+                "name": name,
+                "size": 0,
+                "browser_download_url": "https://github.com/kirisaki8432/KISA/releases/download/" + tag + "/" + name,
+            })
+        return {
+            "tag_name": tag,
+            "name": "KISA Patch " + latest,
+            "body": "",
+            "assets": assets,
+        }
+    except Exception:
+        return None
+
+
 def _update_check(force=False):
     """Hasil cek update (dict JSON-siap). Cache 1 jam kecuali force=True.
     Tidak pernah melempar: gagal jaringan -> {"ok": False}."""
@@ -2931,6 +2974,12 @@ def _update_check(force=False):
         if (not force) and cached and (now - ts) < 3600:
             return cached
         rel = _upd_github_latest()
+        via = "api"
+        if not rel:
+            # Patch 4.7 (S161 Cara 2): API gagal -> jalur cadangan
+            # halaman rilis (tidak kena batas API).
+            rel = _upd_releases_page_latest()
+            via = "releases_page"
         if not rel:
             return {"ok": False, "error": "check_failed",
                     "installed": KISA_VERSION,
@@ -2951,6 +3000,7 @@ def _update_check(force=False):
                "latest_name": str(rel.get("name") or ("KISA Patch " + latest)),
                "body": str(rel.get("body") or ""),
                "update_available": _upd_parse_version(latest) > _upd_parse_version(KISA_VERSION),
+               "via": via,
                "assets": assets,
                "checked_at": int(now)}
         _update_check_cache = (out, now)
