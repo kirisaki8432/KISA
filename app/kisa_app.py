@@ -515,8 +515,25 @@ def start_tray():
     def _toggle_autostart(icon, item):
         set_autostart(not get_autostart())
 
+    # Patch 4.1: "Buka KISA" adalah item DEFAULT (default=True) — inilah
+    # yang membuat klik-kiri SEKALI pada ikon tray langsung menampilkan
+    # jendela, seperti aplikasi lain (mis. Libre Hardware Monitor).
+    # Mekanisme (pystray 0.19.5, dibuktikan dari source, bukan tebakan):
+    #  - pystray/_win32.py _on_notify: WM_LBUTTONUP -> self() (aksi default
+    #    ikon); WM_RBUTTONUP -> TrackPopupMenuEx (menu). Klik kiri TIDAK
+    #    pernah menampilkan menu di backend Win32.
+    #  - pystray/_base.py Icon.__call__: memanggil self._menu(self).
+    #  - pystray/_base.py Menu.__call__: menjalankan item PERTAMA yang
+    #    default=True; bila TIDAK ADA item default, StopIteration -> diam
+    #    tanpa apa-apa. Itulah bug video 2026-11-10: klik ikon tray tidak
+    #    memunculkan apa pun karena tidak ada item default.
+    #  - pystray/_win32.py _create_menu_item: item default juga ditandai
+    #    MFS_DEFAULT sehingga tampil tebal (bold) di menu.
+    # Akibatnya: klik kiri sekali (dan klik ganda, karena LBUTTONUP pertama
+    # juga memicu aksi default) -> _open_kisa_window; klik kanan -> menu
+    # tetap tampil utuh dengan 4 item.
     menu = Menu(
-        MenuItem("Buka KISA", _open_kisa_window),
+        MenuItem("Buka KISA", _open_kisa_window, default=True),
         MenuItem("Buka di Browser", lambda icon, item: _open_in_browser()),
         MenuItem(
             "Jalankan saat Windows nyala",
