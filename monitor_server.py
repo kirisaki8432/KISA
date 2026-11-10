@@ -2730,6 +2730,105 @@ def _fps_debug():
     }
 
 
+# --- Patch 4.1 (S153): status aplikasi pendukung untuk daftar baca-saja di HP ---
+_support_apps_cache = ({}, 0.0)
+
+
+def _win_program_paths(*rels):
+    """Kandidat path program Windows; kosong di luar Windows."""
+    if not IS_WIN:
+        return []
+    roots = []
+    for _env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA"):
+        _v = os.environ.get(_env)
+        if _v:
+            roots.append(_v)
+    out = []
+    for _r in roots:
+        for _rel in rels:
+            out.append(os.path.join(_r, _rel))
+    for _rel in rels:
+        out.append(os.path.join("C:\\", _rel))
+    return out
+
+
+def _proc_running(*names):
+    try:
+        want = {n.lower() for n in names}
+        for _p in psutil.process_iter(["name"]):
+            try:
+                if (_p.info.get("name") or "").lower() in want:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _mahm_present():
+    """True bila shared memory MAHM Afterburner ada (Afterburner jalan)."""
+    if not IS_WIN:
+        return False
+    _fps_afterburner()
+    return _fps_ab_error not in ("not_windows", "no_mapping")
+
+
+def _support_apps():
+    """Status terpasang aplikasi pendukung (Patch 4.1, S153).
+
+    Dipakai daftar baca-saja di halaman Dukungan dashboard (HP): tiap
+    kelompok S153 — python / afterburner / lhm / nocturne / ffmpeg.
+    "Terpasang" = file program ada di PC, atau aplikasinya sedang jalan
+    (proses / MAHM / web server LHM) — jadi aplikasi yang di-install di
+    lokasi lain tetap terdeteksi. Untuk Nocturne sengaja TIDAK memakai
+    sesi GSMTC: GSMTC hanya ada saat lagu sedang diputar, bukan bukti
+    aplikasi ter-install. Python selalu True: server ini sendiri jalan
+    di atas Python + psutil/winsdk/segno.
+    Di-cache 5 detik; semua deteksi dibungkus try/except supaya endpoint
+    ini tidak pernah mematikan server (termasuk di Linux tanpa semua
+    komponen Windows).
+    """
+    global _support_apps_cache
+    now = time.time()
+    if now - _support_apps_cache[1] < 5 and _support_apps_cache[0]:
+        return _support_apps_cache[0]
+    out = {"python": True, "afterburner": False, "lhm": False,
+           "nocturne": False, "ffmpeg": False}
+    try:
+        out["afterburner"] = (
+            any(os.path.exists(_p) for _p in _win_program_paths(
+                os.path.join("MSI Afterburner", "MSIAfterburner.exe")))
+            or _mahm_present()
+            or _proc_running("MSIAfterburner.exe"))
+    except Exception:
+        pass
+    try:
+        out["lhm"] = (
+            any(os.path.exists(_p) for _p in _win_program_paths(
+                os.path.join("LibreHardwareMonitor", "LibreHardwareMonitor.exe"),
+                os.path.join("PCMonitorHUD", "tools", "LibreHardwareMonitor",
+                             "LibreHardwareMonitor.exe")))
+            or _lhm_status in ("ok", "auth")
+            or _proc_running("LibreHardwareMonitor.exe"))
+    except Exception:
+        pass
+    try:
+        out["nocturne"] = (
+            any(os.path.exists(_p) for _p in _win_program_paths(
+                os.path.join("Nocturne Music", "nocturne-app.exe"),
+                os.path.join("Nocturne.Music", "nocturne-app.exe")))
+            or _proc_running("nocturne-app.exe"))
+    except Exception:
+        pass
+    try:
+        out["ffmpeg"] = shutil.which("ffmpeg") is not None
+    except Exception:
+        pass
+    _support_apps_cache = (out, now)
+    return out
+
+
 # --- Auto-start MSI Afterburner + RTSS + LibreHardwareMonitor (perc150) ---
 # User tidak mau lagi membuka aplikasi ini manual: begitu server dashboard
 # dijalankan (Jalankan_di_PC.bat), server menyalakan otomatis aplikasi yang
@@ -4202,6 +4301,11 @@ class Handler(BaseHTTPRequestHandler):
             # Dashboard memanggilnya tiap 250 ms supaya angka FPS
             # mengikuti game lebih cepat (tipikal ±0,89 dtk, dulu ±1,35 dtk).
             self._send(json.dumps(_fps_dict(), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/support_apps" or self.path.startswith("/api/support_apps?"):
+            # Patch 4.1 (S153): status aplikasi pendukung di PC untuk
+            # daftar baca-saja di halaman Dukungan (HP). Di-cache 5 detik
+            # di _support_apps(); tidak pernah melempar.
+            self._send(json.dumps(_support_apps(), ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/bg_compress_progress" or self.path.startswith("/api/bg_compress_progress?"):
             # perc180 (Patch 3.1, S117 Cara 3): progres nyata kompres.
             _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
