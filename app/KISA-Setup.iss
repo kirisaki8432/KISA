@@ -14,7 +14,7 @@
 ; - Auto-start Windows diatur aplikasi sendiri (tray menu / --install-autostart).
 
 #define MyAppName "KISA"
-#define MyAppVersion "4.4"
+#define MyAppVersion "4.6"
 #define MyAppPublisher "kirisaki"
 #define MyAppExeName "KISA.exe"
 
