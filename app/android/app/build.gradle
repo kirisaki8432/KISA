@@ -3,6 +3,20 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Patch 4.2: satu keystore release TETAP (bukan debug keystore yang dibuat
+// tiap runner GitHub baru) supaya APK 4.2+ bisa update menimpa versi lama.
+// Kredensial dibaca dari environment — di CI diisi dari GitHub secrets
+// (KISA_KEYSTORE_PATH, KISA_KEYSTORE_PASSWORD, KISA_KEY_ALIAS,
+// KISA_KEY_PASSWORD; lihat .github/workflows/build-apps.yml). Tanpa env
+// (build lokal), build release memakai signing debug supaya tetap jalan.
+// Catatan: password key == password store (wajib untuk PKCS#12 openssl).
+def kisaKeystorePath = System.getenv("KISA_KEYSTORE_PATH")
+def kisaKeystorePassword = System.getenv("KISA_KEYSTORE_PASSWORD")
+def kisaKeyAlias = System.getenv("KISA_KEY_ALIAS")
+def kisaKeyPassword = System.getenv("KISA_KEY_PASSWORD")
+def hasReleaseKeystore = kisaKeystorePath?.trim() && kisaKeystorePassword?.trim() &&
+    kisaKeyAlias?.trim() && kisaKeyPassword?.trim() && file(kisaKeystorePath).exists()
+
 android {
     namespace 'com.kirisaki.kisa'
     compileSdk 34
@@ -11,13 +25,23 @@ android {
         applicationId "com.kirisaki.kisa"
         minSdk 24
         targetSdk 34
-        versionCode 7
-        versionName "4.1"
+        versionCode 8
+        versionName "4.2"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(kisaKeystorePath ?: "kisa-release.p12")
+            storePassword kisaKeystorePassword
+            keyAlias kisaKeyAlias
+            keyPassword kisaKeyPassword
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig = hasReleaseKeystore ? signingConfigs.release : signingConfigs.debug
         }
     }
     compileOptions {
