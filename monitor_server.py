@@ -47,6 +47,10 @@ except ImportError:
     raise SystemExit("psutil belum terinstal. Jalankan: pip install psutil")
 
 PORT = 8000
+# Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
+# /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
+# Naikkan tiap patch (bersamaan dengan footer dashboard).
+KISA_VERSION = "4.6"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
@@ -2465,6 +2469,11 @@ def _speed_test():
     }
 
 _collect_cache = {}
+# Patch 4.5: single-flight — satu pengambilan collect() berjalan dalam satu
+# waktu. Request /api/data yang datang bersamaan menunggu hasil pengambilan
+# yang sedang berjalan (lalu memakai cache-nya), bukan memulai pengambilan
+# paralel yang menggandakan beban saat server sedang lambat.
+_collect_lock = threading.Lock()
 
 
 def _fps_off():
@@ -2481,12 +2490,28 @@ def collect(skip=None):
     Hasil di-cache 1 detik per kunci skip (perc153): pada refresh 0,5 detik,
     2 request hanya menghitung 1x — pemakaian CPU server turun ~setengah.
     """
-    global _prev_net, _prev_time, _collect_cache, _ULTRA_MONITORS
-    now = time.time()
     skip = frozenset(skip or ())
     _ent = _collect_cache.get(skip)
-    if _ent is not None and now - _ent[1] < 1.0:
+    if _ent is not None and time.time() - _ent[1] < 1.0:
         return _ent[0]
+    with _collect_lock:
+        # Cek lagi: thread lain mungkin baru saja mengisi cache selagi menunggu.
+        _ent = _collect_cache.get(skip)
+        if _ent is not None and time.time() - _ent[1] < 1.0:
+            return _ent[0]
+        return _collect_inner(skip)
+
+
+def _collect_inner(skip):
+    """Satu kali pengambilan penuh (dipanggil dari collect() dengan lock)."""
+    global _prev_net, _prev_time, _collect_cache, _ULTRA_MONITORS
+    now = time.time()
+    # Patch 4.5: instrumentasi — ukur tiap bagian besar (hanya pencatatan,
+    # tidak mengubah nilai sensor, timeout, atau urutan baca).
+    _timings = {"psutil": 0, "network_storage": 0, "lhm": 0, "system": 0,
+                "fans": 0, "now_playing": 0, "fps": 0, "power": 0, "total": 0}
+    _t0 = time.perf_counter()
+    _t_start = _t0
     cpu = psutil.cpu_percent(interval=None)
     per_core = psutil.cpu_percent(interval=None, percpu=True)
     try:
@@ -2496,6 +2521,7 @@ def collect(skip=None):
         freq_mhz = None
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
+    _timings["psutil"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
     net = psutil.net_io_counters()
     if _prev_net is None:
         up_mbps = down_mbps = 0.0
@@ -2526,6 +2552,7 @@ def collect(skip=None):
 
     boot = psutil.boot_time()
     uptime_s = int(now - boot)
+    _timings["network_storage"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
     ultra = "ultra" in skip
     if ultra:
         # Mode Super Ringan (perc154): lewati semua sumber berat (nvidia-smi,
@@ -2560,6 +2587,7 @@ def collect(skip=None):
                 break
         if cpu_temp is None and temps:
             cpu_temp = temps[0]["temp_c"]
+        _timings["lhm"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         gpu_util = None
         gpu_temp = None
         if gpus:
@@ -2575,11 +2603,22 @@ def collect(skip=None):
         _aa = _active_app()
         _ra = _update_recent_apps(_aa)
         _wifi = _wifi_signal()
+        _timings["system"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         _fans = _fans_mobo()
+        _timings["fans"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         _np = _now_playing() if "np" not in skip else _now_playing_cache[0]
+        _timings["now_playing"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         _fps = _fps_dict() if "fps" not in skip else _fps_off()
+        _timings["fps"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         _pow = _power_info(cpu, gpu_util, _model,
                            gpus[0]["name"] if gpus else "", len(_mons))
+        _timings["power"] = int(round((time.perf_counter() - _t0) * 1000))
+    _timings["total"] = int(round((time.perf_counter() - _t_start) * 1000))
+    # Patch 4.5: satu baris peringatan kalau satu collect melewati 2 detik,
+    # menyebut bagian paling lambat — supaya macet berikutnya bisa dilacak.
+    if _timings["total"] > 2000:
+        _slow = max((k for k in _timings if k != "total"), key=lambda k: _timings[k])
+        print(f"[KISA] collect lambat: {_timings['total']} ms (paling lambat: {_slow} {_timings[_slow]} ms)", flush=True)
     result = {
         "time": time.strftime("%H:%M:%S"),
         "host": platform.node(),
@@ -2617,6 +2656,7 @@ def collect(skip=None):
         "fans_mobo": _fans,
         "power": _pow,
         "uptime": {"hours": uptime_s // 3600, "minutes": (uptime_s % 3600) // 60},
+        "timings_ms": _timings,
     }
     _collect_cache[skip] = (result, time.time())
     return result
@@ -2827,6 +2867,216 @@ def _support_apps():
         pass
     _support_apps_cache = (out, now)
     return out
+
+
+# --- Patch 4.6 (S157 Cara 1): Periksa Pembaruan dari dalam aplikasi -------
+# PERMANEN: fitur ini bagian tetap KISA, terbawa ke patch berikutnya.
+# Alur: GET /api/check_update (rilis GitHub terbaru, cache 1 jam) ->
+# POST /api/download_update (server mengunduh aset ke folder sementara,
+# progres dilacak) -> GET /api/download_progress (persen nyata) ->
+# PC: POST /api/install_update (jalankan installer, aplikasi menutup diri
+# dulu — kalau tidak, file terkunci seperti instal 3.9) / HP: GET
+# /api/update_file (APK diambil HP lewat bridge KisaApp.downloadApk).
+# Semua kegagalan jaringan ditangkap -> JSON netral, tidak pernah traceback.
+_APP_QUIT_FN = None  # diisi kisa_app.py (start_server) dengan _quit_app
+_update_check_cache = (None, 0.0)
+_update_dl = {"state": "idle", "pct": 0, "downloaded": 0, "total": 0,
+              "name": None, "path": None, "error": None}
+_update_dl_lock = threading.Lock()
+_UPDATE_DL_DIR = None
+_UPDATE_GH_URL = "https://api.github.com/repos/kirisaki8432/KISA/releases/latest"
+
+
+def _upd_parse_version(s):
+    """'v4.6' / '4.6' -> (4, 6, 0). Bagian non-angka dihitung 0."""
+    try:
+        s = (s or "").strip()
+        if s[:1].lower() == "v":
+            s = s[1:]
+        parts = []
+        for p in s.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                parts.append(0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _upd_github_latest():
+    """Ambil rilis terbaru GitHub (dict) atau None bila gagal. Timeout 10 dtk."""
+    try:
+        req = urllib.request.Request(
+            _UPDATE_GH_URL,
+            headers={"User-Agent": "KISA-Updater",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+
+def _update_check(force=False):
+    """Hasil cek update (dict JSON-siap). Cache 1 jam kecuali force=True.
+    Tidak pernah melempar: gagal jaringan -> {"ok": False}."""
+    global _update_check_cache
+    now = time.time()
+    try:
+        cached, ts = _update_check_cache
+        if (not force) and cached and (now - ts) < 3600:
+            return cached
+        rel = _upd_github_latest()
+        if not rel:
+            return {"ok": False, "error": "check_failed",
+                    "installed": KISA_VERSION,
+                    "installed_tag": "v" + KISA_VERSION}
+        tag = str(rel.get("tag_name") or "")
+        latest = tag[1:] if tag[:1].lower() == "v" else tag
+        assets = []
+        for a in (rel.get("assets") or []):
+            try:
+                assets.append({"name": str(a.get("name") or ""),
+                               "size": int(a.get("size") or 0),
+                               "url": str(a.get("browser_download_url") or "")})
+            except Exception:
+                continue
+        out = {"ok": True,
+               "installed": KISA_VERSION, "installed_tag": "v" + KISA_VERSION,
+               "latest": latest, "latest_tag": tag,
+               "latest_name": str(rel.get("name") or ("KISA Patch " + latest)),
+               "body": str(rel.get("body") or ""),
+               "update_available": _upd_parse_version(latest) > _upd_parse_version(KISA_VERSION),
+               "assets": assets,
+               "checked_at": int(now)}
+        _update_check_cache = (out, now)
+        return out
+    except Exception:
+        return {"ok": False, "error": "check_failed",
+                "installed": KISA_VERSION, "installed_tag": "v" + KISA_VERSION}
+
+
+def _update_dl_set(**kw):
+    with _update_dl_lock:
+        _update_dl.update(kw)
+
+
+def _update_download_worker(url, name, total):
+    """Unduh aset GitHub ke folder sementara; progres di _update_dl."""
+    global _UPDATE_DL_DIR
+    try:
+        import tempfile
+        if not _UPDATE_DL_DIR:
+            _UPDATE_DL_DIR = tempfile.mkdtemp(prefix="kisa_update_")
+        dest = os.path.join(_UPDATE_DL_DIR, name)
+        req = urllib.request.Request(url, headers={"User-Agent": "KISA-Updater"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or total or 0)
+            _update_dl_set(state="downloading", pct=0, downloaded=0,
+                           total=total, name=name, path=dest, error=None)
+            got = 0
+            with open(dest, "wb") as fh:
+                while True:
+                    chunk = resp.read(1024 * 256)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+                    pct = int(got * 100 / total) if total else 0
+                    _update_dl_set(downloaded=got, pct=min(100, pct))
+        _update_dl_set(state="done", pct=100, downloaded=got, total=total or got)
+    except Exception as e:
+        _update_dl_set(state="error", error="download_failed")
+        try:
+            print("KISA update: unduhan gagal -", e)
+        except Exception:
+            pass
+
+
+def _update_start_download(asset_name):
+    """Mulai unduh aset (nama harus ada di hasil cek terakhir). Bila sedang
+    berjalan, kembalikan progres saat ini."""
+    try:
+        with _update_dl_lock:
+            cur = dict(_update_dl)
+        if cur.get("state") == "downloading":
+            return {"ok": True, "state": "downloading", "pct": cur.get("pct", 0)}
+        data = _update_check()
+        assets = (data.get("assets") or []) if data.get("ok") else []
+        want = None
+        for a in assets:
+            if a.get("name") == asset_name:
+                want = a
+                break
+        if not want or not want.get("url"):
+            return {"ok": False, "error": "asset_not_found"}
+        _update_dl_set(state="downloading", pct=0, downloaded=0,
+                       total=int(want.get("size") or 0), name=asset_name,
+                       path=None, error=None)
+        threading.Thread(target=_update_download_worker,
+                         args=(want["url"], asset_name, int(want.get("size") or 0)),
+                         daemon=True, name="kisa-update-dl").start()
+        return {"ok": True, "state": "downloading", "pct": 0}
+    except Exception:
+        return {"ok": False, "error": "download_failed"}
+
+
+def _update_install(asset_name):
+    """PC: jalankan installer yang sudah diunduh, lalu tutup aplikasi
+    dengan bersih. Kembalikan dict JSON-siap (ok/error)."""
+    try:
+        with _update_dl_lock:
+            cur = dict(_update_dl)
+        if cur.get("state") != "done" or not cur.get("path"):
+            return {"ok": False, "error": "not_downloaded"}
+        if asset_name and cur.get("name") != asset_name:
+            return {"ok": False, "error": "not_downloaded"}
+        path = cur["path"]
+        if not os.path.exists(path):
+            return {"ok": False, "error": "not_downloaded"}
+        if os.name != "nt":
+            return {"ok": False, "error": "unsupported_platform"}
+        # Jalankan installer (wizard terlihat, tanpa argumen senyap),
+        # lalu tutup aplikasi setelah jeda singkat supaya file tidak
+        # terkunci saat installer mengganti KISA.exe.
+        try:
+            subprocess.Popen([path],
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        except Exception:
+            try:
+                os.startfile(path)
+            except Exception:
+                return {"ok": False, "error": "launch_failed"}
+
+        def _quit_later():
+            try:
+                time.sleep(1.5)
+            except Exception:
+                pass
+            try:
+                fn = _APP_QUIT_FN
+            except Exception:
+                fn = None
+            if fn:
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_quit_later, daemon=True,
+                         name="kisa-update-quit").start()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False, "error": "install_failed"}
 
 
 # --- Auto-start MSI Afterburner + RTSS + LibreHardwareMonitor (perc150) ---
@@ -4306,6 +4556,52 @@ class Handler(BaseHTTPRequestHandler):
             # daftar baca-saja di halaman Dukungan (HP). Di-cache 5 detik
             # di _support_apps(); tidak pernah melempar.
             self._send(json.dumps(_support_apps(), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/check_update" or self.path.startswith("/api/check_update?"):
+            # Patch 4.6 (S157 Cara 1): cek rilis GitHub terbaru.
+            # force=1 = lewati cache 1 jam (tombol Periksa Pembaruan).
+            # Gagal jaringan -> {"ok": False} netral, tidak pernah traceback.
+            _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _force = (_qs.get("force") or ["0"])[0] == "1"
+            self._send(json.dumps(_update_check(force=_force), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/download_progress" or self.path.startswith("/api/download_progress?"):
+            # Patch 4.6: progres unduhan update (persen nyata dari server).
+            with _update_dl_lock:
+                _pd = dict(_update_dl)
+            _pd.pop("path", None)
+            self._send(json.dumps(_pd, ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/update_file" or self.path.startswith("/api/update_file?"):
+            # Patch 4.6: layani file update yang sudah diunduh (untuk HP).
+            # Nama harus sama persis dengan unduhan yang selesai.
+            _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _nm = (_qs.get("name") or [""])[0]
+            with _update_dl_lock:
+                _fd = dict(_update_dl)
+            _ok = (_fd.get("state") == "done" and _fd.get("name") == _nm
+                   and _fd.get("path") and os.path.exists(_fd["path"]))
+            if not _ok:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not found")
+            else:
+                _ctype = ("application/vnd.android.package-archive"
+                          if _nm.lower().endswith(".apk") else "application/octet-stream")
+                try:
+                    _size = os.path.getsize(_fd["path"])
+                except Exception:
+                    _size = 0
+                self.send_response(200)
+                self.send_header("Content-Type", _ctype)
+                self.send_header("Content-Length", str(_size))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="%s"' % _nm)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                with open(_fd["path"], "rb") as _fh:
+                    while True:
+                        _chunk = _fh.read(1024 * 1024)
+                        if not _chunk:
+                            break
+                        self.wfile.write(_chunk)
         elif self.path == "/api/bg_compress_progress" or self.path.startswith("/api/bg_compress_progress?"):
             # perc180 (Patch 3.1, S117 Cara 3): progres nyata kompres.
             _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -4368,6 +4664,28 @@ class Handler(BaseHTTPRequestHandler):
                     _gsmtc_cache = (None, 0)
                     _fallback_cache = (None, 0)
             self._send(json.dumps({"ok": bool(ok)}), "application/json")
+        elif self.path == "/api/download_update":
+            # Patch 4.6: mulai unduh aset update (nama harus ada di hasil
+            # cek terakhir). Unduhan jalan di thread latar; progres lewat
+            # GET /api/download_progress.
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            _asset = str(body.get("asset") or "")
+            self._send(json.dumps(_update_start_download(_asset), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/install_update":
+            # Patch 4.6: jalankan installer yang sudah diunduh, lalu tutup
+            # aplikasi dengan bersih (PC). HP tidak memakai endpoint ini —
+            # APK dipasang lewat bridge KisaApp.downloadApk.
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            _asset = str(body.get("asset") or "")
+            self._send(json.dumps(_update_install(_asset), ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/speedtest":
             self._send(json.dumps(_speed_test()), "application/json")
         elif self.path.startswith("/api/bg_compress"):
