@@ -295,6 +295,11 @@ def start_server():
 
     import monitor_server as ms  # noqa: PLC0415 - import lokal disengaja
 
+    # Patch 4.6 (S157 Cara 1): izinkan server memicu keluar bersih saat
+    # install update — aplikasi HARUS menutup diri dulu sebelum installer
+    # jalan (kalau tidak, file terkunci seperti instal 3.9).
+    ms._APP_QUIT_FN = _quit_app
+
     def _run():
         global _server
         # 1. Listen DULU — ini satu-satunya yang ditunggu main() /
