@@ -3,8 +3,11 @@ package com.kirisaki.kisa
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Dialog
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -17,6 +20,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
@@ -47,6 +51,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.graphics.drawable.DrawableCompat
 
 /**
@@ -68,6 +73,8 @@ import androidx.core.graphics.drawable.DrawableCompat
  * "Scan QR" satu grup di tengah) + imersif dialog — bar HP disembunyikan
  * saat dialog tampil, ketuk layar = toggle tampil/sembunyi (tegak maupun
  * kesamping); bar kembali muncul saat dialog ditutup.
+ * Patch 4.6: bridge JS KisaApp.downloadApk (S157 Cara 1) — unduh APK update
+ * dari server PC lewat DownloadManager lalu pasang via FileProvider.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -873,6 +880,86 @@ class MainActivity : AppCompatActivity() {
                 else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
             runOnUiThread { requestedOrientation = orientation }
+        }
+
+        /**
+         * Bridge JS untuk dashboard (Patch 4.6, S157 Cara 1): unduh APK
+         * update dari server PC lalu pasang.
+         *
+         * Signature: fun downloadApk(url: String?, fileName: String?)
+         * url = alamat file APK di server PC
+         * (mis. http://192.168.1.10:8000/api/update_file?name=KISA-4.6.apk).
+         * fileName = nama file APK (harus berakhiran .apk, tanpa path).
+         * Alur: DownloadManager mengunduh ke Download/KISA/ -> saat selesai,
+         * intent instal dibuka lewat FileProvider. Android TETAP minta user
+         * mengizinkan "instal aplikasi tidak dikenal" sekali + mengetuk
+         * Instal — tidak bisa pasang diam-diam.
+         * Dashboard harus memanggil secara defensif (hanya jika window.KisaApp ada).
+         */
+        @JavascriptInterface
+        fun downloadApk(url: String?, fileName: String?) {
+            val cleanUrl = url?.trim().orEmpty()
+            val cleanName = fileName?.trim().orEmpty()
+            if (cleanUrl.isEmpty() || !(cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://"))) return
+            if (cleanName.isEmpty() || !cleanName.endsWith(".apk") || cleanName.contains("/") || cleanName.contains("\\")) return
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Mengunduh update KISA…", Toast.LENGTH_SHORT).show()
+            }
+            try {
+                val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                val req = DownloadManager.Request(Uri.parse(cleanUrl))
+                    .setTitle("KISA update")
+                    .setDescription(cleanName)
+                    .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    .setMimeType("application/vnd.android.package-archive")
+                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "KISA/$cleanName")
+                val dlId = dm.enqueue(req)
+                val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        val doneId = intent?.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L) ?: -1L
+                        if (doneId != dlId) return
+                        try { unregisterReceiver(this) } catch (e: Exception) { }
+                        try {
+                            val q = DownloadManager.Query().setFilterById(dlId)
+                            val cursor = dm.query(q)
+                            var ok = false
+                            var localUri: String? = null
+                            cursor?.use {
+                                if (it.moveToFirst()) {
+                                    val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                                    ok = status == DownloadManager.STATUS_SUCCESSFUL
+                                    localUri = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
+                                }
+                            }
+                            if (!ok) {
+                                runOnUiThread { Toast.makeText(this@MainActivity, "Unduhan update gagal.", Toast.LENGTH_LONG).show() }
+                                return
+                            }
+                            val file = java.io.File(Uri.parse(localUri).path ?: "")
+                            if (!file.exists()) {
+                                runOnUiThread { Toast.makeText(this@MainActivity, "File update tidak ditemukan.", Toast.LENGTH_LONG).show() }
+                                return
+                            }
+                            val contentUri = FileProvider.getUriForFile(this@MainActivity, "${packageName}.fileprovider", file)
+                            val install = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(contentUri, "application/vnd.android.package-archive")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(install)
+                        } catch (e: Exception) {
+                            runOnUiThread { Toast.makeText(this@MainActivity, "Gagal memasang update.", Toast.LENGTH_LONG).show() }
+                        }
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+                } else {
+                    registerReceiver(receiver, filter)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this@MainActivity, "Gagal mengunduh update.", Toast.LENGTH_LONG).show() }
+            }
         }
     }
 
