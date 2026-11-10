@@ -6,6 +6,7 @@ dari HP yang tersambung ke Wi-Fi yang sama.
 
 > 📖 Versi singkat ada di README.md bagian "Cara pakai". File ini versi
 > langkah-demi-langkah untuk yang baru pertama kali memasang.
+> Panduan pengguna baru (jalur installer + setting tiap aplikasi pendukung): [PANDUAN_PENGGUNA_BARU.md](PANDUAN_PENGGUNA_BARU.md)
 
 ## Yang dibutuhkan
 
@@ -17,8 +18,9 @@ dari HP yang tersambung ke Wi-Fi yang sama.
 | Internet (saat setup) | Untuk mengunduh Python, Afterburner, LHM, Nocturne |
 | Python 3 | Dicek & dipasang otomatis oleh Setup (lihat Langkah 2) |
 
-Sisanya — MSI Afterburner, LibreHardwareMonitor, Nocturne — diurus oleh
-Setup Otomatis. Yang wajib dipasang manual hanya **FFmpeg** (Langkah 4).
+Sisanya — MSI Afterburner, LibreHardwareMonitor, Nocturne, dan FFmpeg —
+diurus oleh Setup Otomatis. FFmpeg dipasang otomatis sejak Patch 4.1;
+Langkah 4 di bawah ini hanya diperlukan kalau pemasangan otomatis gagal.
 
 ## Langkah 1 — Unduh dan ekstrak
 
@@ -68,7 +70,8 @@ yang ditandai "(kemungkinan hotspot HP)" (biasanya `192.168.43.x`).
 
 ## Langkah 4 — Pasang FFmpeg (untuk kompres latar video)
 
-Setup Otomatis **tidak** memasang FFmpeg — ini satu-satunya langkah manual.
+Setup Otomatis memasang FFmpeg otomatis (langkah 8) sejak Patch 4.1 —
+langkah ini hanya diperlukan kalau pemasangan otomatis gagal.
 
 1. Buka **Command Prompt sebagai Administrator** (cari `cmd` di Start →
    klik kanan → Run as administrator).
