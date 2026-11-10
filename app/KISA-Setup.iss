@@ -1,20 +1,20 @@
-; KISA-Setup.iss — Installer KISA (Patch 4.1, S153 Cara 3) untuk Inno Setup 6.
+; KISA-Setup.iss — Installer KISA (Patch 4.2) untuk Inno Setup 6.
 ; Dijalankan SETELAH PyInstaller membuat dist\KISA.exe:
 ;     pyinstaller app\KISA.spec
 ;     iscc app\KISA-Setup.iss
-; Hasil: dist-installer\KISA-Setup-4.1.exe
+; Hasil: dist-installer\KISA-Setup-4.2.exe
 ;
 ; Catatan:
 ; - KISA.exe (onefile) sudah berisi Python + server + dashboard; installer
 ;   tidak perlu memasang Python.
 ; - Komponen pendukung (Python + paket, MSI Afterburner, LibreHardwareMonitor,
 ;   Nocturne, FFmpeg) ditawarkan di halaman wizard "Aplikasi Pendukung"
-;   (Patch 4.1, S153 Cara 3 — dikelompokkan per fitur, PC saja) dan dipasang
+;   (ditambah di Patch 4.1, S153 Cara 3 — dikelompokkan per fitur, PC saja) dan dipasang
 ;   lewat Setup_Otomatis.bat yang ikut terinstal, sesuai kelompok yang dicentang.
 ; - Auto-start Windows diatur aplikasi sendiri (tray menu / --install-autostart).
 
 #define MyAppName "KISA"
-#define MyAppVersion "4.1"
+#define MyAppVersion "4.2"
 #define MyAppPublisher "kirisaki"
 #define MyAppExeName "KISA.exe"
 
@@ -67,7 +67,7 @@ Type: files; Name: "{app}\QR_Dashboard.png"
 Type: files; Name: "{app}\*.log"
 
 [Code]
-{ Patch 4.1 (S153 Cara 3): halaman wizard "Aplikasi Pendukung".
+{ Halaman wizard "Aplikasi Pendukung" (S153 Cara 3, ditambah di Patch 4.1).
   Menampilkan 5 kelompok aplikasi pendukung per fitur, lengkap dengan
   status "Sudah ada" / "Belum ada" yang dideteksi saat halaman dibuka.
   Kelompok yang sudah ada: checkbox dimatikan (tidak bisa dicentang).
