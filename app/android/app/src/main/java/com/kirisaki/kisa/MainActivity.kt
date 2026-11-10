@@ -140,6 +140,9 @@ class MainActivity : AppCompatActivity() {
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private var customView: View? = null
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+    // Patch 4.7 (S145 Cara 1): fullscreen aplikasi via bridge
+    // dashboard (bukan via Fullscreen API browser).
+    private var isAppFullscreen = false
     private var fullscreenContainer: FrameLayout? = null
 
     // ------------------------------------------------------------------
@@ -845,7 +848,7 @@ class MainActivity : AppCompatActivity() {
         // Patch 4.0 (S149 Cara 2): pergantian fokus (mis. kembali dari
         // dialog sistem) bisa menghapus flag imersif — pasang lagi selama
         // masih fullscreen.
-        if (hasFocus && customView != null) hideSystemBars()
+        if (hasFocus && (customView != null || isAppFullscreen)) hideSystemBars()
     }
 
     @Deprecated("Dipakai untuk tombol kembali WebView.")
@@ -854,6 +857,15 @@ class MainActivity : AppCompatActivity() {
         // fullscreen dulu — bukan mundur halaman / menutup aplikasi.
         if (customView != null) {
             webView.webChromeClient?.onHideCustomView()
+            return
+        }
+        // Patch 4.7 (S145 Cara 1): Back keluar dari fullscreen aplikasi
+        // dulu — bukan mundur halaman / menutup aplikasi. Beri tahu
+        // dashboard lewat hook supaya ikon fullscreen ikut tersinkron.
+        if (isAppFullscreen) {
+            isAppFullscreen = false
+            showSystemBars()
+            webView.evaluateJavascript("window.__kisaAppFsExit && window.__kisaAppFsExit();", null)
             return
         }
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
@@ -880,6 +892,28 @@ class MainActivity : AppCompatActivity() {
                 else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
             runOnUiThread { requestedOrientation = orientation }
+        }
+
+        /**
+         * Bridge JS untuk dashboard (Patch 4.7, S145 Cara 1): fullscreen
+         * asli di aplikasi (tanpa title bar / status bar / nav bar).
+         *
+         * Signature: fun setFullscreen(on: Boolean)
+         * on=true  -> sembunyikan bar sistem (pakai helper S149 yang
+         *             sudah ada: non-sticky, usap memunculkan bar).
+         * on=false -> kembalikan bar sistem.
+         * Back keluar dari fullscreen ditangani onBackPressed (bukan di
+         * sini) supaya ikon dashboard ikut tersinkron lewat hook
+         * window.__kisaAppFsExit.
+         * Dashboard harus memanggil secara defensif (hanya jika
+         * window.KisaApp ada).
+         */
+        @JavascriptInterface
+        fun setFullscreen(on: Boolean) {
+            runOnUiThread {
+                isAppFullscreen = on
+                if (on) hideSystemBars() else showSystemBars()
+            }
         }
 
         /**
