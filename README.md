@@ -31,6 +31,7 @@
 ## 🚀 Cara pakai
 
 > 📖 **Baru pertama kali pasang?** Ikuti [TUTORIAL.md](TUTORIAL.md) — panduan langkah demi langkah (unduh, setup, buka di HP, pasang FFmpeg, troubleshooting). Naskah video tutorialnya ada di [NASKAH_VIDEO.md](NASKAH_VIDEO.md).
+> Panduan pengguna baru (installer + setting tiap aplikasi pendukung): [PANDUAN_PENGGUNA_BARU.md](PANDUAN_PENGGUNA_BARU.md)
 
 1. **Download** file zip dari halaman [Releases](../../releases) (atau clone repo ini), lalu **ekstrak ke folder baru**.
 2. **Jalankan `Jalankan_di_PC.bat`** dari folder hasil ekstrak. Biarkan jendela hitamnya tetap terbuka selama dashboard dipakai.
