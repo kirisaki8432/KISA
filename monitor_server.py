@@ -51,7 +51,7 @@ PORT = 8000
 # Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
 # /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
 # Naikkan tiap patch (bersamaan dengan footer dashboard).
-KISA_VERSION = "4.9"
+KISA_VERSION = "5.0"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
@@ -3091,15 +3091,48 @@ def _upd_releases_page_latest():
         return None
 
 
+_upd_file_version_cache = {"mtime": None, "version": None}
+
+
+def _upd_file_version():
+    """Patch 5.0 (S174 Cara 3 — Server Baca Versi File): baca versi dari
+    file dashboard.html di disk (kotak set-nav-ver), bukan dari konstanta
+    KISA_VERSION di memori. Jadi jawaban 'installed' selalu sama dengan
+    file dashboard yang sedang dilayani, walau proses server masih dari
+    folder lama. Cache per mtime file; gagal baca -> KISA_VERSION."""
+    try:
+        p = BASE_DIR / "dashboard.html"
+        st = p.stat()
+        if _upd_file_version_cache["mtime"] == st.st_mtime and _upd_file_version_cache["version"]:
+            return _upd_file_version_cache["version"]
+        html = p.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'class="set-nav-ver">KISA Patch ([0-9]+\.[0-9]+)', html)
+        v = m.group(1) if m else KISA_VERSION
+        _upd_file_version_cache["mtime"] = st.st_mtime
+        _upd_file_version_cache["version"] = v
+        return v
+    except Exception:
+        return KISA_VERSION
+
+
 def _update_check(force=False):
     """Hasil cek update (dict JSON-siap). Cache 1 jam kecuali force=True.
     Tidak pernah melempar: gagal jaringan -> {"ok": False}."""
     global _update_check_cache
     now = time.time()
+    installed = _upd_file_version()  # Patch 5.0 (S174): versi dari file, bukan konstanta
     try:
         cached, ts = _update_check_cache
         if (not force) and cached and (now - ts) < 3600:
-            return cached
+            # Patch 5.0 (S174): cache GitHub tetap dipakai, tapi 'installed'
+            # selalu dibaca ulang dari file dashboard.html (bisa berubah
+            # bila user menaruh dashboard baru tanpa restart server).
+            _out = dict(cached)
+            _out["installed"] = installed
+            _out["installed_tag"] = "v" + installed
+            _out["installed_proc"] = KISA_VERSION
+            _out["update_available"] = _upd_parse_version(_out.get("latest") or "") > _upd_parse_version(installed)
+            return _out
         rel = _upd_github_latest()
         via = "api"
         if not rel:
@@ -3109,8 +3142,9 @@ def _update_check(force=False):
             via = "releases_page"
         if not rel:
             return {"ok": False, "error": "check_failed",
-                    "installed": KISA_VERSION,
-                    "installed_tag": "v" + KISA_VERSION}
+                    "installed": installed,
+                    "installed_tag": "v" + installed,
+                    "installed_proc": KISA_VERSION}
         tag = str(rel.get("tag_name") or "")
         latest = tag[1:] if tag[:1].lower() == "v" else tag
         assets = []
@@ -3122,11 +3156,12 @@ def _update_check(force=False):
             except Exception:
                 continue
         out = {"ok": True,
-               "installed": KISA_VERSION, "installed_tag": "v" + KISA_VERSION,
+               "installed": installed, "installed_tag": "v" + installed,
+               "installed_proc": KISA_VERSION,
                "latest": latest, "latest_tag": tag,
                "latest_name": str(rel.get("name") or ("KISA Patch " + latest)),
                "body": str(rel.get("body") or ""),
-               "update_available": _upd_parse_version(latest) > _upd_parse_version(KISA_VERSION),
+               "update_available": _upd_parse_version(latest) > _upd_parse_version(installed),
                "via": via,
                "assets": assets,
                "checked_at": int(now)}
@@ -3134,7 +3169,8 @@ def _update_check(force=False):
         return out
     except Exception:
         return {"ok": False, "error": "check_failed",
-                "installed": KISA_VERSION, "installed_tag": "v" + KISA_VERSION}
+                "installed": installed, "installed_tag": "v" + installed,
+                "installed_proc": KISA_VERSION}
 
 
 def _update_dl_set(**kw):
@@ -4742,6 +4778,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps(_install_support_status(_app or None), ensure_ascii=False).encode("utf-8"), "application/json")
             except Exception:
                 self._send(json.dumps({"ok": False, "error": "status_failed"}, ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/installed_version" or self.path.startswith("/api/installed_version?"):
+            # Patch 5.0 (S174 Cara 3): versi terpasang DARI FILE dashboard.html
+            # di disk (bukan konstanta proses) — ringan, tanpa cek GitHub.
+            _iv = _upd_file_version()
+            self._send(json.dumps({"ok": True, "installed": _iv,
+                                   "installed_tag": "v" + _iv,
+                                   "installed_proc": KISA_VERSION},
+                                  ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/check_update" or self.path.startswith("/api/check_update?"):
             # Patch 4.6 (S157 Cara 1): cek rilis GitHub terbaru.
             # force=1 = lewati cache 1 jam (tombol Periksa Pembaruan).
