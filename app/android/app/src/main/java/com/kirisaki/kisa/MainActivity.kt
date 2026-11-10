@@ -15,6 +15,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,6 +25,8 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -56,6 +59,9 @@ import androidx.core.graphics.drawable.DrawableCompat
  * Patch 3.7: dialog alamat kustom S142 Cara 1 (kartu tengah, programatik, token
  * Nocturne mengikuti night mode sistem) + overlay loading / error dengan timeout
  * 15 detik saat dashboard gagal dimuat.
+ * Patch 4.0: imersif penuh saat fullscreen (S149 Cara 2) — status bar +
+ * tombol navigasi sistem disembunyikan total; hanya ⛶ lagi / Back yang
+ * memunculkan.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -119,6 +125,57 @@ class MainActivity : AppCompatActivity() {
     private var customView: View? = null
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
     private var fullscreenContainer: FrameLayout? = null
+
+    // ------------------------------------------------------------------
+    // Imersif fullscreen (Patch 4.0, S149 Cara 2 — Imersif Penuh).
+    //
+    // Saat dashboard masuk fullscreen (tombol ⛶), status bar + tombol
+    // navigasi sistem disembunyikan secara TOTAL (bukan lengket): usap
+    // dari tepi masih bisa memunculkan bar sistem (perilaku Android yang
+    // tidak bisa dicegah), tapi bar tidak disembunyikan lagi secara paksa
+    // — tombol Back tetap bisa dipakai untuk keluar dari fullscreen. Bar
+    // kembali normal saat fullscreen ditutup. Sengaja TIDAK ada listener
+    // yang menyembunyikan ulang bar begitu muncul: itu akan membuat
+    // tombol Back tidak bisa dijangkau.
+    // ------------------------------------------------------------------
+
+    @Suppress("DEPRECATION")
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.let { controller ->
+                controller.hide(
+                    WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
+                )
+                // Non-sticky: usap memunculkan bar dan bar TETAP tampil
+                // sampai aplikasi menyembunyikannya lagi (di sini: saat
+                // keluar dari fullscreen).
+                controller.systemBarsBehavior =
+                    WindowInsetsController.BEHAVIOR_SHOW_BARS_BY_SWIPE
+            }
+        } else {
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE
+                )
+            // SYSTEM_UI_FLAG_IMMERSIVE (tanpa STICKY): usap memunculkan
+            // bar dan bar tetap tampil sampai disembunyikan lagi.
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun showSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.show(
+                WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
+            )
+        } else {
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
+    }
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.GetContent()
@@ -474,9 +531,14 @@ class MainActivity : AppCompatActivity() {
                 )
                 fullscreenContainer = container
                 webView.visibility = View.GONE
+                // Patch 4.0 (S149 Cara 2): sembunyikan status bar + tombol
+                // navigasi sistem selama fullscreen.
+                hideSystemBars()
             }
 
             override fun onHideCustomView() {
+                // Patch 4.0 (S149 Cara 2): kembalikan bar sistem.
+                showSystemBars()
                 customView?.let { view ->
                     fullscreenContainer?.removeView(view)
                 }
@@ -675,8 +737,22 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Patch 4.0 (S149 Cara 2): pergantian fokus (mis. kembali dari
+        // dialog sistem) bisa menghapus flag imersif — pasang lagi selama
+        // masih fullscreen.
+        if (hasFocus && customView != null) hideSystemBars()
+    }
+
     @Deprecated("Dipakai untuk tombol kembali WebView.")
     override fun onBackPressed() {
+        // Patch 4.0 (S149 Cara 2): saat fullscreen, Back keluar dari
+        // fullscreen dulu — bukan mundur halaman / menutup aplikasi.
+        if (customView != null) {
+            webView.webChromeClient?.onHideCustomView()
+            return
+        }
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
 
