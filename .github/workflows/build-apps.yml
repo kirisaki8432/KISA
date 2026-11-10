@@ -1,7 +1,7 @@
 # Build KISA Apps — .exe Windows + .apk Android (S138 Cara 3)
 #
-# Berjalan saat tag v* di-push (mis. v4.6) atau dijalankan manual.
-# Hasil: KISA.exe + KISA-Setup-4.6.exe (Windows) dan KISA-4.6.apk (Android)
+# Berjalan saat tag v* di-push (mis. v4.7) atau dijalankan manual.
+# Hasil: KISA.exe + KISA-Setup-4.7.exe (Windows) dan KISA-4.7.apk (Android)
 # di tab Artifacts setiap job.
 #
 # Catatan jujur:
@@ -58,19 +58,19 @@ jobs:
       - name: Build installer (Inno Setup)
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" app\KISA-Setup.iss
-          if (-not (Test-Path "dist-installer/KISA-Setup-4.6.exe")) { throw "Installer tidak ditemukan" }
+          if (-not (Test-Path "dist-installer/KISA-Setup-4.7.exe")) { throw "Installer tidak ditemukan" }
 
       - name: Upload KISA.exe
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-exe-4.6
+          name: KISA-exe-4.7
           path: dist/KISA.exe
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-Setup-4.6
-          path: dist-installer/KISA-Setup-4.6.exe
+          name: KISA-Setup-4.7
+          path: dist-installer/KISA-Setup-4.7.exe
 
   build-android:
     name: "Android: KISA.apk (WebView)"
@@ -116,13 +116,13 @@ jobs:
           ls -la app/android/app/build/outputs/apk/release/
           test -f app/android/app/build/outputs/apk/release/app-release.apk
 
-      - name: Rename APK (KISA-4.6.apk)
+      - name: Rename APK (KISA-4.7.apk)
         run: |
-          mv app/android/app/build/outputs/apk/release/app-release.apk app/android/app/build/outputs/apk/release/KISA-4.6.apk
+          mv app/android/app/build/outputs/apk/release/app-release.apk app/android/app/build/outputs/apk/release/KISA-4.7.apk
           ls -la app/android/app/build/outputs/apk/release/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-apk-4.6
-          path: app/android/app/build/outputs/apk/release/KISA-4.6.apk
+          name: KISA-apk-4.7
+          path: app/android/app/build/outputs/apk/release/KISA-4.7.apk
