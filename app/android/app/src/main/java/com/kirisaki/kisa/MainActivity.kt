@@ -25,6 +25,7 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.webkit.JavascriptInterface
@@ -38,6 +39,7 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -62,6 +64,10 @@ import androidx.core.graphics.drawable.DrawableCompat
  * Patch 4.0: imersif penuh saat fullscreen (S149 Cara 2) — status bar +
  * tombol navigasi sistem disembunyikan total; hanya ⛶ lagi / Back yang
  * memunculkan.
+ * Patch 4.2: dialog "Hubungkan ke PC" dirapikan (jarak rata, ikon + teks
+ * "Scan QR" satu grup di tengah) + imersif dialog — bar HP disembunyikan
+ * saat dialog tampil, ketuk layar = toggle tampil/sembunyi (tegak maupun
+ * kesamping); bar kembali muncul saat dialog ditutup.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -71,6 +77,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var loadingOverlay: LinearLayout
     private lateinit var errorOverlay: LinearLayout
     private var addressDialog: Dialog? = null
+    // Patch 4.2: state imersif dialog "Hubungkan ke PC" — true = bar HP
+    // sedang disembunyikan (toggle lewat ketuk layar).
+    private var addressDialogBarsHidden = false
 
     // State siklus load dashboard (Patch 3.7): onPageFinished yang datang dari
     // load yang gagal tidak boleh menyembunyikan overlay error.
@@ -139,21 +148,22 @@ class MainActivity : AppCompatActivity() {
     // tombol Back tidak bisa dijangkau.
     // ------------------------------------------------------------------
 
+    // Patch 4.2: hide/show kini memakai helper berbasis Window agar bisa
+    // dipakai juga untuk jendela Dialog "Hubungkan ke PC" (bukan hanya
+    // jendela Activity). Perilaku S149 tidak berubah: non-sticky, usap
+    // memunculkan bar dan bar TETAP tampil sampai disembunyikan lagi.
     @Suppress("DEPRECATION")
-    private fun hideSystemBars() {
+    private fun hideBarsOnWindow(win: Window) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.let { controller ->
+            win.insetsController?.let { controller ->
                 controller.hide(
                     WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
                 )
-                // Non-sticky: usap memunculkan bar dan bar TETAP tampil
-                // sampai aplikasi menyembunyikannya lagi (di sini: saat
-                // keluar dari fullscreen).
                 controller.systemBarsBehavior =
                     WindowInsetsController.BEHAVIOR_SHOW_BARS_BY_SWIPE
             }
         } else {
-            window.decorView.systemUiVisibility = (
+            win.decorView.systemUiVisibility = (
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
@@ -167,13 +177,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun showSystemBars() {
+    private fun showBarsOnWindow(win: Window) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.show(
+            win.insetsController?.show(
                 WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
             )
         } else {
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            win.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
+    }
+
+    private fun hideSystemBars() = hideBarsOnWindow(window)
+
+    private fun showSystemBars() = showBarsOnWindow(window)
+
+    // Patch 4.2: toggle bar HP untuk dialog "Hubungkan ke PC" — ketuk layar
+    // (di luar tombol/input) sekali muncul, sekali hilang; berlaku tegak
+    // maupun kesamping. Ketuk pada tombol dialog tetap berfungsi normal
+    // karena tombol mengonsumsi sentuhannya sendiri.
+    private fun toggleAddressDialogBars() {
+        val dialog = addressDialog ?: return
+        addressDialogBarsHidden = !addressDialogBarsHidden
+        if (addressDialogBarsHidden) {
+            hideSystemBars()
+            dialog.window?.let { hideBarsOnWindow(it) }
+        } else {
+            showSystemBars()
+            dialog.window?.let { showBarsOnWindow(it) }
         }
     }
 
@@ -253,32 +283,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun secondaryButton(t: ThemeColors, text: String, withIcon: Boolean = false): Button {
-        return Button(this).apply {
-            this.text = text
-            setAllCaps(false)
-            textSize = 14f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(t.text)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(10).toFloat()
-                setColor(Color.TRANSPARENT)
-                setStroke(dp(1), if (t.night) 0x38FFFFFF.toInt() else 0x38000000.toInt())
-            }
-            backgroundTintList = null
-            setPadding(dp(12), dp(11), dp(12), dp(11))
-            if (withIcon) {
+    private fun secondaryButton(t: ThemeColors, text: String, withIcon: Boolean = false): View {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(10).toFloat()
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(1), if (t.night) 0x38FFFFFF.toInt() else 0x38000000.toInt())
+        }
+        if (withIcon) {
+            // Patch 4.2: ikon + teks SATU grup di tengah. Button biasa
+            // menaruh compound drawable di kiri dan teks di tengah, jadi
+            // ikon tampak jauh di kiri sementara teks di tengah (keluhan
+            // user di screenshot dialog). Row ini memakai gravity CENTER
+            // dengan tinggi minimum sama seperti tombol (48dp).
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                isClickable = true
+                isFocusable = true
+                background = bg
+                backgroundTintList = null
+                minimumHeight = dp(48)
+                setPadding(dp(12), dp(11), dp(12), dp(11))
                 // Ikon framework yang pasti ada (bukan drawable aplikasi).
                 val icon = ContextCompat.getDrawable(
                     this@MainActivity, android.R.drawable.ic_menu_camera
                 )?.mutate()
                 if (icon != null) {
                     DrawableCompat.setTint(icon, t.text)
-                    setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null)
-                    compoundDrawablePadding = dp(7)
+                    val iconView = ImageView(this@MainActivity).apply {
+                        setImageDrawable(icon)
+                    }
+                    addView(
+                        iconView,
+                        LinearLayout.LayoutParams(dp(18), dp(18)).apply {
+                            marginEnd = dp(7)
+                        }
+                    )
                 }
+                val label = TextView(this@MainActivity).apply {
+                    this.text = text
+                    textSize = 14f
+                    setTypeface(typeface, Typeface.BOLD)
+                    setTextColor(t.text)
+                }
+                addView(
+                    label,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                )
             }
+        }
+        return Button(this).apply {
+            this.text = text
+            setAllCaps(false)
+            textSize = 14f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(t.text)
+            background = bg
+            backgroundTintList = null
+            setPadding(dp(12), dp(11), dp(12), dp(11))
         }
     }
 
@@ -290,6 +356,10 @@ class MainActivity : AppCompatActivity() {
             setTextColor(t.secondary)
             setBackgroundColor(Color.TRANSPARENT)
             backgroundTintList = null
+            // Patch 4.2: minHeight default Button (48dp) membuat jarak
+            // "Batal" ke tombol di atasnya tampak jauh lebih besar dari
+            // jarak antar elemen lain — matikan agar jaraknya rata.
+            minimumHeight = 0
             setPadding(dp(8), dp(4), dp(8), dp(4))
         }
     }
@@ -623,6 +693,8 @@ class MainActivity : AppCompatActivity() {
      * tanpa XML layout / drawable baru — mengikuti gaya ScanActivity.
      * Perilaku sama seperti AlertDialog lama: Hubungkan dengan input kosong
      * hanya menampilkan Toast dan dialog tetap terbuka.
+     * Patch 4.2: jarak antar elemen rata (10dp), ikon + teks "Scan QR" satu
+     * grup di tengah, dialog imersif (bar HP hilang, ketuk layar = toggle).
      */
     private fun askForAddress() {
         addressDialog?.dismiss()
@@ -692,13 +764,13 @@ class MainActivity : AppCompatActivity() {
                 dialog.dismiss()
                 loadDashboard(url)
             }
-            addView(connect, fullWidthParams(8))
+            addView(connect, fullWidthParams(10))
             val scan = secondaryButton(t, "Scan QR", withIcon = true)
             scan.setOnClickListener {
                 dialog.dismiss()
                 requestCameraAndScan()
             }
-            addView(scan, fullWidthParams(8))
+            addView(scan, fullWidthParams(10))
             val cancel = textButton(t, "Batal")
             cancel.setOnClickListener { dialog.dismiss() }
             addView(
@@ -709,32 +781,56 @@ class MainActivity : AppCompatActivity() {
                 ).apply { gravity = Gravity.CENTER_HORIZONTAL }
             )
         }
+        // Patch 4.2: container selayar penuh dengan kartu di tengah — ketuk
+        // di mana saja di luar tombol/input (judul, subjudul, celah, area
+        // redup) = toggle bar HP. Tombol/input mengonsumsi sentuhannya
+        // sendiri sehingga tetap berfungsi normal.
         val container = FrameLayout(this).apply {
             setPadding(dp(24), 0, dp(24), 0)
+            setOnClickListener { toggleAddressDialogBars() }
             addView(
                 card,
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER
                 )
             )
         }
         dialog = Dialog(this).apply {
             setContentView(container)
             setCancelable(true)
-            setCanceledOnTouchOutside(true)
+            // Patch 4.2: ketuk di luar kartu = toggle bar HP, bukan tutup
+            // dialog (tutup lewat "Batal" atau Back).
+            setCanceledOnTouchOutside(false)
             window?.apply {
                 setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
                 setLayout(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
+                    ViewGroup.LayoutParams.MATCH_PARENT
                 )
                 setDimAmount(if (t.night) 0.55f else 0.35f)
             }
-            setOnDismissListener { if (addressDialog === dialog) addressDialog = null }
+            setOnDismissListener {
+                if (addressDialog === dialog) addressDialog = null
+                // Patch 4.2: bar HP kembali normal saat dialog ditutup.
+                addressDialogBarsHidden = false
+                showSystemBars()
+            }
         }
         addressDialog = dialog
         dialog.show()
+        // Patch 4.2: imersif saat dialog tampil (tegak maupun kesamping).
+        addressDialogBarsHidden = true
+        hideSystemBars()
+        dialog.window?.let { hideBarsOnWindow(it) }
+        // Jendela dialog baru terpasang setelah show() — pasang lagi begitu
+        // decorView siap, supaya bar benar-benar hilang.
+        dialog.window?.decorView?.post {
+            if (addressDialog === dialog && addressDialogBarsHidden) {
+                dialog.window?.let { hideBarsOnWindow(it) }
+            }
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
