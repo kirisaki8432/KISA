@@ -1,7 +1,7 @@
 # Build KISA Apps — .exe Windows + .apk Android (S138 Cara 3)
 #
-# Berjalan saat tag v* di-push (mis. v4.1) atau dijalankan manual.
-# Hasil: KISA.exe + KISA-Setup-4.1.exe (Windows) dan KISA-4.1.apk (Android)
+# Berjalan saat tag v* di-push (mis. v4.2) atau dijalankan manual.
+# Hasil: KISA.exe + KISA-Setup-4.2.exe (Windows) dan KISA-4.2.apk (Android)
 # di tab Artifacts setiap job.
 #
 # Catatan jujur:
@@ -10,6 +10,12 @@
 # - Job Android memakai setup-android + Gradle; APK yang dihasilkan adalah
 #   wrapper WebView (app/android) yang membuka server LAN PC — BUKAN TWA
 #   (TWA butuh PWA di URL HTTPS publik, lihat app/twa/README.md).
+# - Patch 4.2: APK ditandatangani SATU keystore release tetap (bukan debug
+#   keystore tiap runner) supaya update menimpa versi lama. Keystore ditulis
+#   dari secret KISA_KEYSTORE_BASE64 (file .p12, ephemeral — runner dihapus
+#   setelah job, tidak pernah masuk repo). Secret lain: KISA_KEYSTORE_PASSWORD,
+#   KISA_KEY_ALIAS, KISA_KEY_PASSWORD. Bila secret belum di-set, job Android
+#   GAGAL dengan pesan jelas (bukan diam-diam debug-signed).
 
 name: Build KISA Apps
 
@@ -52,19 +58,19 @@ jobs:
       - name: Build installer (Inno Setup)
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" app\KISA-Setup.iss
-          if (-not (Test-Path "dist-installer/KISA-Setup-4.1.exe")) { throw "Installer tidak ditemukan" }
+          if (-not (Test-Path "dist-installer/KISA-Setup-4.2.exe")) { throw "Installer tidak ditemukan" }
 
       - name: Upload KISA.exe
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-exe-4.1
+          name: KISA-exe-4.2
           path: dist/KISA.exe
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-Setup-4.1
-          path: dist-installer/KISA-Setup-4.1.exe
+          name: KISA-Setup-4.2
+          path: dist-installer/KISA-Setup-4.2.exe
 
   build-android:
     name: "Android: KISA.apk (WebView)"
@@ -85,25 +91,38 @@ jobs:
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
 
+      - name: Tulis keystore release (dari secret)
+        run: |
+          if [ -z "$KISA_KEYSTORE_BASE64" ]; then echo "KISA_KEYSTORE_BASE64 belum di-set — tambah 4 secret signing di repo Settings > Secrets and variables > Actions (KISA_KEYSTORE_BASE64, KISA_KEYSTORE_PASSWORD, KISA_KEY_ALIAS, KISA_KEY_PASSWORD)"; exit 1; fi
+          printf '%s' "$KISA_KEYSTORE_BASE64" | base64 -d > app/android/kisa-release.p12
+          test -s app/android/kisa-release.p12
+        env:
+          KISA_KEYSTORE_BASE64: ${{ secrets.KISA_KEYSTORE_BASE64 }}
+
       - name: Build APK (Gradle)
         uses: gradle/gradle-build-action@v3
         with:
           gradle-version: "8.7"
-          arguments: assembleDebug
+          arguments: assembleRelease
           build-root-directory: app/android
+        env:
+          KISA_KEYSTORE_PATH: ${{ github.workspace }}/app/android/kisa-release.p12
+          KISA_KEYSTORE_PASSWORD: ${{ secrets.KISA_KEYSTORE_PASSWORD }}
+          KISA_KEY_ALIAS: ${{ secrets.KISA_KEY_ALIAS }}
+          KISA_KEY_PASSWORD: ${{ secrets.KISA_KEY_PASSWORD }}
 
       - name: Cek hasil apk
         run: |
-          ls -la app/android/app/build/outputs/apk/debug/
-          test -f app/android/app/build/outputs/apk/debug/app-debug.apk
+          ls -la app/android/app/build/outputs/apk/release/
+          test -f app/android/app/build/outputs/apk/release/app-release.apk
 
-      - name: Rename APK (KISA-4.1.apk)
+      - name: Rename APK (KISA-4.2.apk)
         run: |
-          mv app/android/app/build/outputs/apk/debug/app-debug.apk app/android/app/build/outputs/apk/debug/KISA-4.1.apk
-          ls -la app/android/app/build/outputs/apk/debug/
+          mv app/android/app/build/outputs/apk/release/app-release.apk app/android/app/build/outputs/apk/release/KISA-4.2.apk
+          ls -la app/android/app/build/outputs/apk/release/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-apk-4.1
-          path: app/android/app/build/outputs/apk/debug/KISA-4.1.apk
+          name: KISA-apk-4.2
+          path: app/android/app/build/outputs/apk/release/KISA-4.2.apk
