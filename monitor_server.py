@@ -34,6 +34,7 @@ import re
 import socket
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -50,7 +51,7 @@ PORT = 8000
 # Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
 # /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
 # Naikkan tiap patch (bersamaan dengan footer dashboard).
-KISA_VERSION = "4.7"
+KISA_VERSION = "4.8"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
@@ -2817,7 +2818,7 @@ def _mahm_present():
 def _support_apps():
     """Status terpasang aplikasi pendukung (Patch 4.1, S153).
 
-    Dipakai daftar baca-saja di halaman Dukungan dashboard (HP): tiap
+    Dipakai daftar status di halaman Dukungan dashboard (HP) — tiap
     kelompok S153 — python / afterburner / lhm / nocturne / ffmpeg.
     "Terpasang" = file program ada di PC, atau aplikasinya sedang jalan
     (proses / MAHM / web server LHM) — jadi aplikasi yang di-install di
@@ -2867,6 +2868,132 @@ def _support_apps():
         pass
     _support_apps_cache = (out, now)
     return out
+
+
+# --- Patch 4.8 (S163 Cara 1): pasang aplikasi pendukung dari Dukungan -----
+_INSTALL_SUPPORT_KEYS = ("python", "afterburner", "lhm", "nocturne", "ffmpeg")
+_install_support_jobs = {}  # kunci -> {"state": ..., "error": ...}
+_install_support_lock = threading.Lock()
+
+
+def _install_support_find_bat():
+    """Lokasi Setup_Otomatis.bat: di samping monitor_server.py (jalur zip),
+    di samping KISA.exe saat frozen (installer menyalin .bat ke Program
+    Files\\KISA), atau di folder kerja. None bila tidak ketemu."""
+    cands = []
+    try:
+        cands.append(str(BASE_DIR / "Setup_Otomatis.bat"))
+    except Exception:
+        pass
+    try:
+        if getattr(sys, "frozen", False):
+            cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "Setup_Otomatis.bat"))
+    except Exception:
+        pass
+    try:
+        cands.append(os.path.join(os.getcwd(), "Setup_Otomatis.bat"))
+    except Exception:
+        pass
+    for _c in cands:
+        try:
+            if _c and os.path.isfile(_c):
+                return _c
+        except Exception:
+            continue
+    return None
+
+
+def _install_support_detect(key):
+    """Deteksi segar satu aplikasi (lewati cache 5 detik _support_apps)."""
+    global _support_apps_cache
+    try:
+        _support_apps_cache = ({}, 0.0)
+        return bool(_support_apps().get(key))
+    except Exception:
+        return False
+
+
+def _install_support_set(key, state, error=""):
+    try:
+        with _install_support_lock:
+            _install_support_jobs[key] = {"state": state, "error": error}
+    except Exception:
+        pass
+
+
+def _install_support_run(key):
+    """Jalankan Setup_Otomatis.bat <kunci> di thread latar. Fase dibaca dari
+    output .bat (mengekstrak / menjalankan installer / berhasil = memasang).
+    stdin DEVNULL supaya `pause` di jalur :fatal langsung lanjut (tidak
+    menggantung menunggu tombol). Selesai = returncode 0 DAN aplikasi
+    terdeteksi terpasang; sisanya gagal."""
+    bat = _install_support_find_bat()
+    if bat is None:
+        _install_support_set(key, "failed", "setup_not_found")
+        return
+    _install_support_set(key, "downloading")
+    try:
+        proc = subprocess.Popen(
+            [bat, key], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+            text=True, errors="replace", bufsize=1)
+    except Exception:
+        _install_support_set(key, "failed", "start_failed")
+        return
+    try:
+        for _line in proc.stdout:
+            _low = _line.lower()
+            if ("mengekstrak" in _low or "menjalankan installer" in _low
+                    or "berhasil diinstall" in _low or "berhasil di-install" in _low
+                    or "berhasil di-download" in _low):
+                with _install_support_lock:
+                    _j = _install_support_jobs.get(key)
+                    if _j and _j.get("state") == "downloading":
+                        _j["state"] = "installing"
+        proc.wait()
+        _rc = proc.returncode
+    except Exception:
+        _rc = 1
+    _ok = (_rc == 0) and _install_support_detect(key)
+    _install_support_set(key, "done" if _ok else "failed",
+                         "" if _ok else ("install_failed" if _rc == 0 else "setup_failed"))
+
+
+def _install_support_start(key):
+    """Mulai job bila belum jalan; kembalikan state saat ini."""
+    try:
+        with _install_support_lock:
+            _cur = _install_support_jobs.get(key)
+            if _cur and _cur.get("state") in ("downloading", "installing"):
+                return {"ok": True, "app": key, "state": _cur["state"]}
+        if _install_support_detect(key):
+            _install_support_set(key, "done")
+            return {"ok": True, "app": key, "state": "done"}
+        _install_support_set(key, "downloading")
+        _t = threading.Thread(target=_install_support_run, args=(key,), daemon=True)
+        _t.start()
+        return {"ok": True, "app": key, "state": "downloading"}
+    except Exception:
+        return {"ok": False, "error": "start_failed"}
+
+
+def _install_support_status(app=None):
+    """Status job: satu kunci, atau semua job bila app kosong."""
+    try:
+        with _install_support_lock:
+            _jobs = dict(_install_support_jobs)
+        if app:
+            if app not in _INSTALL_SUPPORT_KEYS:
+                return {"ok": False, "error": "unknown_app"}
+            _j = _jobs.get(app)
+            return {"ok": True, "app": app,
+                    "state": (_j or {}).get("state", "idle")}
+        return {"ok": True, "jobs": {
+            _k: {"state": _v.get("state", "idle")}
+            for _k, _v in _jobs.items()}}
+    except Exception:
+        return {"ok": False, "error": "status_failed"}
 
 
 # --- Patch 4.6 (S157 Cara 1): Periksa Pembaruan dari dalam aplikasi -------
@@ -4603,9 +4730,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps(_fps_dict(), ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/support_apps" or self.path.startswith("/api/support_apps?"):
             # Patch 4.1 (S153): status aplikasi pendukung di PC untuk
-            # daftar baca-saja di halaman Dukungan (HP). Di-cache 5 detik
+            # daftar status di halaman Dukungan (HP; sejak 4.8 ada tombol
+            # "Unduh & Pasang" per aplikasi). Di-cache 5 detik
             # di _support_apps(); tidak pernah melempar.
             self._send(json.dumps(_support_apps(), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/install_support_app" or self.path.startswith("/api/install_support_app?"):
+            # Patch 4.8 (S163): status job pasang aplikasi pendukung.
+            try:
+                _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                _app = (_qs.get("app") or [""])[0][:32]
+                self._send(json.dumps(_install_support_status(_app or None), ensure_ascii=False).encode("utf-8"), "application/json")
+            except Exception:
+                self._send(json.dumps({"ok": False, "error": "status_failed"}, ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/check_update" or self.path.startswith("/api/check_update?"):
             # Patch 4.6 (S157 Cara 1): cek rilis GitHub terbaru.
             # force=1 = lewati cache 1 jam (tombol Periksa Pembaruan).
@@ -4736,6 +4872,20 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             _asset = str(body.get("asset") or "")
             self._send(json.dumps(_update_install(_asset), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/install_support_app":
+            # Patch 4.8 (S163): mulai pasang satu aplikasi pendukung lewat
+            # Setup_Otomatis.bat (hanya 5 kunci yang dikenal; kunci lain
+            # ditolak — tidak pernah menjalankan perintah sembarangan).
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            _app = str(body.get("app") or "").strip().lower()
+            if _app not in _INSTALL_SUPPORT_KEYS:
+                self._send(json.dumps({"ok": False, "error": "unknown_app"}, ensure_ascii=False).encode("utf-8"), "application/json")
+            else:
+                self._send(json.dumps(_install_support_start(_app), ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/speedtest":
             self._send(json.dumps(_speed_test()), "application/json")
         elif self.path.startswith("/api/bg_compress"):
