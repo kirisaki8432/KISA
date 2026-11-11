@@ -286,7 +286,6 @@ begin
   Icon.Font.Size := 9;
   Icon.Caption := IconText;
   Icon.Alignment := taCenter;
-  Icon.VerticalAlignment := taVerticalCenter;
   Icon.BevelOuter := bvNone;
   { Judul (tebal) + deskripsi (abu-abu, satu baris ala S193) }
   TitleLbl := TNewStaticText.Create(SupportPage);
@@ -352,7 +351,6 @@ begin
   Logo.Font.Size := 13;
   Logo.Caption := 'K';
   Logo.Alignment := taCenter;
-  Logo.VerticalAlignment := taVerticalCenter;
   Logo.BevelOuter := bvNone;
   AppTitle := TNewStaticText.Create(SupportPage);
   AppTitle.Parent := SupportPage.Surface;
@@ -383,7 +381,6 @@ begin
   Badge.Font.Size := 8;
   Badge.Caption := 'Patch 5.1';
   Badge.Alignment := taCenter;
-  Badge.VerticalAlignment := taVerticalCenter;
   Badge.BevelOuter := bvNone;
   Intro := TNewStaticText.Create(SupportPage);
   Intro.Parent := SupportPage.Surface;
