@@ -24,8 +24,8 @@ Suhu di Windows:
 Hanya untuk jaringan lokal. Jangan expose port 8000 ke internet.
 Butuh: psutil saja.
 """
-import asyncio
 import base64
+import ctypes
 import json
 import hashlib
 import os
@@ -51,14 +51,17 @@ PORT = 8000
 # Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
 # /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
 # Naikkan tiap patch (bersamaan dengan footer dashboard).
-KISA_VERSION = "5.0"
+KISA_VERSION = "5.1"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
 _prev_net = None
 _prev_time = None
 _temp_cache = ([], 0.0)
-_monitor_cache = ([], 0.0)
+_monitor_cache = ([], 0.0, "")
+# Info hasil scan ctypes terakhir (Patch 5.1 perc216): jumlah device
+# ter-attach + pesan error bila ada; dipakai /api/monitors_debug.
+_monitor_ctypes_info = {"attached": 0, "error": "" if IS_WIN else "bukan windows"}
 _disk_types_cache = ({}, 0.0)
 _wifi_cache = (None, 0.0)
 
@@ -80,30 +83,84 @@ def _local_ips():
     return ips
 
 
+def _primary_ip():
+    """IP yang dipakai QR dashboard (perc213 — perbaikan bug hotspot 212).
+
+    BUG 212: QR memakai ips[0] = IP pertama dari urutan enumerasi psutil —
+    di PC user ada adapter virtual yang masih memegang IP LAN lama dan muncul
+    duluan, padahal PC sudah pindah ke hotspot HP (IP hotspot). Hasil: QR
+    menunjuk alamat yang tidak ada di jaringan hotspot -> HP "Tidak dapat
+    terhubung ke PC".
+    CARA KERJA: (1) UDP connect ke 8.8.8.8:80 (tanpa kirim data) -> IP lokal
+    pada interface rute default; (2) bila gagal, IP interface yang namanya
+    mengandung "wi-fi"/"wlan"/"wireless" (Windows) atau "wlp" (Linux);
+    (3) fallback ips[0]."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    try:
+        for name, addrs in psutil.net_if_addrs().items():
+            low = name.lower()
+            if ("wi-fi" in low or "wlan" in low or "wireless" in low
+                    or low.startswith("wlp")):
+                for a in addrs:
+                    if a.family == socket.AF_INET and not a.address.startswith("127."):
+                        return a.address
+    except Exception:
+        pass
+    ips = _local_ips()
+    return ips[0] if ips else None
+
+
+def _qr_ip_for(qs):
+    """IP untuk QR: ?ip= (dipilih manual dari popup) bila ada di daftar IP
+    lokal, kalau tidak IP rute default dari _primary_ip()."""
+    ip = None
+    try:
+        vals = qs.get("ip", [])
+        if vals and vals[0]:
+            cand = vals[0].strip()
+            if cand in _local_ips():
+                ip = cand
+    except Exception:
+        ip = None
+    return ip or _primary_ip()
+
+
 _QR_PNG = BASE_DIR / "QR_Dashboard.png"
 _QR_IP = None  # IP LAN yang dipakai QR terakhir (untuk regenerasi live di /qr.png)
 
 
-def _dashboard_qr():
-    """Buat QR code http://<IP-LAN>:8000 di QR_Dashboard.png, dibuat ULANG tiap
+def _dashboard_qr(ip=None):
+    """Buat QR code http://<IP>:8000 di QR_Dashboard.png, dibuat ULANG tiap
     server mulai (IP bisa berubah bila DHCP ganti). Pakai segno (pure Python,
     tanpa dependensi). Gagal (segno belum ter-install / tidak ada IP LAN) ->
-    peringatan saja, server tetap jalan tanpa QR. Kembalikan URL-nya, atau None."""
+    peringatan saja, server tetap jalan tanpa QR. Kembalikan URL-nya, atau None.
+    perc213: IP dari _primary_ip() (rute default / WiFi) — bukan lagi ips[0];
+    argumen ip dipakai bila pengguna memilih IP manual dari popup QR."""
     global _QR_IP
     _QR_IP = None
     try:
-        ips = _local_ips()
-        if not ips:
+        chosen = ip or _primary_ip()
+        if not chosen:
             print("QR dashboard: tidak ada IP LAN, QR tidak dibuat.")
             return None
         import segno
-        url = "http://%s:%d" % (ips[0], PORT)
+        url = "http://%s:%d" % (chosen, PORT)
         qr = segno.make(url, error="m")
         modules = qr.symbol_size(border=0)[0]
         scale = max(1, round(512 / (modules + 8)))
         qr.save(str(_QR_PNG), kind="png", scale=scale, border=4,
                 dark="black", light="white")
-        _QR_IP = ips[0]
+        _QR_IP = chosen
         return url
     except ImportError:
         print("QR dashboard: library 'segno' belum ter-install — QR tidak dibuat.")
@@ -127,6 +184,7 @@ def _ensure_firewall_rule():
             ["netsh", "advfirewall", "firewall", "show", "rule",
              "name=KISA"],
             capture_output=True, timeout=10, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         if chk.returncode == 0 and "KISA" in (chk.stdout or ""):
             return True
@@ -135,6 +193,7 @@ def _ensure_firewall_rule():
              "name=KISA", "dir=in", "action=allow",
              "protocol=TCP", "localport=8000", "profile=any"],
             capture_output=True, timeout=15, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return r.returncode == 0
     except Exception:
@@ -208,6 +267,7 @@ def _gpu_info():
             ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
              "--format=csv,noheader,nounits"],
             timeout=3, stderr=subprocess.DEVNULL, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         ).strip()
         if not out:
             return []
@@ -393,6 +453,7 @@ def _lhm_hosts():
 
 
 _lhm_fetch_cache = (None, "", "", 0.0)
+_lhm_first_probe_done = False
 
 
 def _lhm_fetch():
@@ -422,10 +483,16 @@ def _lhm_fetch_uncached():
     Status disimpan global supaya dashboard bisa menampilkan penyebabnya,
     bukan cuma 'tidak tersedia' yang membingungkan.
     """
-    global _lhm_status, _lhm_host
+    global _lhm_status, _lhm_host, _lhm_first_probe_done
+    # Patch 5.1 (perc206): probe pertama pakai timeout pendek (0,5 dtk).
+    # LHM lokal merespons <100 ms bila jalan; bila mati, koneksi langsung
+    # ditolak / cepat gagal — tidak perlu menunggu 2 dtk per host (dulu
+    # sampai ~4 dtk untuk 2 host). Probe berikutnya tetap timeout 2 dtk.
+    _timeout = 0.5 if not _lhm_first_probe_done else 2
+    _lhm_first_probe_done = True
     for host in _lhm_hosts():
         try:
-            with urllib.request.urlopen(f"http://{host}:8085/data.json", timeout=2) as r:
+            with urllib.request.urlopen(f"http://{host}:8085/data.json", timeout=_timeout) as r:
                 data = json.loads(r.read().decode("utf-8", errors="ignore"))
             _lhm_status = "ok"
             _lhm_host = host
@@ -710,7 +777,7 @@ def _parse_monitor_brands(txt):
             display = f"{brand} {model}"
         else:
             display = brand or model
-        brands.append({"brand": brand, "model": model, "display": display})
+        brands.append({"brand": brand, "model": model, "display": display, "instance": parts[0].strip()})
     return brands
 
 
@@ -726,39 +793,43 @@ def _monitor_brands():
     """
     if not IS_WIN:
         return []
-    ps = r"""
-Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
-  $man = (($_.ManufacturerName | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
-  $fr = (($_.UserFriendlyName | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
-  $ser = (($_.SerialNumberID | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
-  "$($_.InstanceName)|$man|$fr|$ser"
-}
-"""
+    ps = _PS_EDID
     brands = _parse_monitor_brands(_run_ps(ps))
     if any(b["display"] for b in brands):
         return brands
     txt = _run_ps(
         "Get-CimInstance Win32_DesktopMonitor -ErrorAction SilentlyContinue | "
-        "ForEach-Object { \"$($_.Name)|$($_.MonitorManufacturer)\" }"
+        "ForEach-Object { \"$($_.PNPDeviceID)|$($_.Name)|$($_.MonitorManufacturer)\" }"
     )
     out = []
     for line in txt.splitlines():
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) >= 2 and parts[1]:
-            out.append({"brand": parts[1], "model": "", "display": parts[1]})
+        if len(parts) >= 3 and parts[2]:
+            out.append({"instance": parts[0], "brand": parts[2], "model": "", "display": parts[1]})
+        elif len(parts) >= 2 and parts[1]:
+            out.append({"instance": parts[0], "brand": "", "model": "", "display": parts[1]})
         else:
-            out.append({"brand": "", "model": "", "display": ""})
+            out.append({"instance": parts[0] if parts else "", "brand": "", "model": "", "display": ""})
     return out
 
 
-_PORT_NAMES = {1: "VGA", 5: "DVI", 6: "HDMI", 10: "DisplayPort", 18: "USB-C"}
+# Patch 5.1 perc215 FIX (bug 214 — pemetaan port off-by-one TERBUKTI):
+# VideoOutputTechnology WMI mengikuti enum D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY
+# (dokumentasi Microsoft): VGA/HD15=0, SVIDEO=1, COMPOSITE=2, COMPONENT=3,
+# DVI=4, HDMI=5, LVDS=6, D_JPN=7, SDI=8, DISPLAYPORT_EXTERNAL=9,
+# DISPLAYPORT_EMBEDDED=10, UDI=11/12, SDTVDONGLE=13, MIRACAST=14,
+# INTERNAL=15. Map 214 (1=VGA, 5=DVI, 6=HDMI, 18=USB-C) salah satu langkah:
+# WMI mengembalikan 5 (HDMI) untuk Lenovo L24i-30 tapi tampil "DVI"
+# (RX 6600 tidak punya DVI, L24i-30 tidak punya input DVI — DVI mustahil).
+# MSI tampil "DisplayPort" hanya karena WMI mengembalikan 10.
+_PORT_NAMES = {0: "VGA", 4: "DVI", 5: "HDMI", 9: "DisplayPort", 10: "DisplayPort"}
 
 
 def _port_name(tech):
-    """Map VideoOutputTechnology (WMI / DisplayConfig) ke label port fisik.
+    """Map VideoOutputTechnology (WMI, enum D3DKMDT) ke label port fisik.
 
-    Hanya port eksternal yang ditampilkan; layar internal laptop,
-    wireless (Miracast), OTHER, dan nilai tak dikenal -> "" (tidak
+    Hanya port eksternal yang ditampilkan; layar internal laptop (15),
+    wireless (Miracast 14), OTHER, dan nilai tak dikenal -> "" (tidak
     ditampilkan, bukan ditebak).
     """
     try:
@@ -777,42 +848,52 @@ def _monitor_ports():
     """
     if not IS_WIN:
         return []
-    txt = _run_ps(
-        "Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorConnectionParams "
-        "-ErrorAction SilentlyContinue | ForEach-Object { \"$($_.VideoOutputTechnology)\" }"
-    )
-    return [_port_name(line.strip()) for line in txt.splitlines() if line.strip()]
-
-
-def _monitors():
-    """Scan monitor maks. 4, Windows saja. Di-cache 60 detik.
-
-    Cara lama (Win32_VideoController) hanya mengembalikan 1 baris per GPU,
-    jadi monitor ke-2/3/4 yang menempel di GPU yang sama tidak pernah
-    muncul. Karena itu sekarang dipakai, berurutan:
-    1. EnumDisplaySettings per DISPLAY1..DISPLAY10 (user32) -> resolusi
-       DAN refresh rate per monitor yang sebenarnya, bukan per GPU.
-    2. Fallback: [System.Windows.Forms.Screen]::AllScreens -> jumlah dan
-       resolusi tiap layar, refresh rate diambil dari VideoController.
-    3. Fallback terakhir: Win32_VideoController (1 monitor per GPU).
-    Nama GPU diambil dari VideoController pertama dan dipakai untuk
-    semua monitor, karena semua monitor itu biasanya di GPU yang sama.
-    """
-    global _monitor_cache
-    now = time.time()
-    if now - _monitor_cache[1] < 60 and _monitor_cache[0]:
-        return _monitor_cache[0]
+    txt = _run_ps(_PS_PORTS_RAW)
     out = []
-    if IS_WIN:
-        gpu_name = ""
-        txt_gpu = _run_ps(
-            "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
-            "Select-Object -First 1 -ExpandProperty Name"
-        ).strip()
-        if txt_gpu:
-            gpu_name = txt_gpu.splitlines()[0].strip()
-        # 1. EnumDisplaySettings
-        ps_enum = r"""
+    for line in txt.splitlines():
+        if "|" not in line:
+            continue
+        inst, tech = line.split("|", 1)
+        # Patch 5.1 perc215: simpan nilai ANGKA mentah (tech) untuk
+        # /api/monitors_debug — pemetaan label bisa diverifikasi.
+        try:
+            _tech = int(tech.strip())
+        except (TypeError, ValueError):
+            _tech = None
+        out.append({"instance": inst.strip(), "port": _port_name(tech.strip()), "tech": _tech})
+    return out
+
+
+def _monitor_pnp_map():
+    """Map InstanceName EDID -> nomor DISPLAY (Win32_DesktopMonitor).
+
+    Dipakai memasangkan merek EDID dengan display aktif yang tepat,
+    supaya nama dua monitor tidak tertukar. Cocokkan dulu persis
+    (huruf besar), lalu fallback kode model (segmen setelah DISPLAY\\)
+    bila hanya cocok dengan SATU entri EDID. Di luar Windows -> {}.
+    """
+    if not IS_WIN:
+        return {}
+    txt = _run_ps(_PS_PNP_RAW)
+    out = {}
+    for line in (txt or "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            digits = "".join(ch for ch in parts[1] if ch.isdigit())
+            if digits:
+                out[parts[0].upper()] = int(digits)
+    return out
+
+
+
+# Patch 5.1 perc215 — skrip PowerShell deteksi monitor (dipakai _monitors()
+# dan /api/monitors_debug). EnumDisplayDevices dulu (daftar device +
+# StateFlags: 1 = terpasang ke desktop), lalu EnumDisplaySettings per
+# device yang ter-attach — nama device diambil dari Windows sendiri
+# (bukan literal DISPLAY1..10). Output: DEV|DeviceName|StateFlags|DeviceID
+# lalu DSP|num|lebar|tinggi|hz|orientasi (orientasi DEVMODE: 0/2 lanskap,
+# 1/3 potret 90°/270°).
+_PS_ENUM_DISPLAYS = r"""
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -828,43 +909,263 @@ public class Disp {
     public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;
     public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
   }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public struct DISPLAY_DEVICE {
+    public int cb;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string DeviceName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceString;
+    public int StateFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceID;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceKey;
+  }
   [DllImport("user32.dll")] public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
 }
 '@;
-for ($i=1; $i -le 10; $i++) { $dm = New-Object Disp+DEVMODE; $dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm); if ([Disp]::EnumDisplaySettings("\\\\.\\DISPLAY$i", -1, [ref]$dm)) { if ($dm.dmPelsWidth -gt 0) { "$i|$($dm.dmPelsWidth)|$($dm.dmPelsHeight)|$($dm.dmDisplayFrequency)" } } }
+for ($i=0; $i -lt 10; $i++) { $dd = New-Object Disp+DISPLAY_DEVICE; $dd.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($dd); if ([Disp]::EnumDisplayDevices($null, [uint32]$i, [ref]$dd, 0)) { "DEV|$($dd.DeviceName)|$($dd.StateFlags)|$($dd.DeviceID)" } }
+for ($i=0; $i -lt 10; $i++) { $dd = New-Object Disp+DISPLAY_DEVICE; $dd.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($dd); if ([Disp]::EnumDisplayDevices($null, [uint32]$i, [ref]$dd, 0)) { if (($dd.StateFlags -band 1) -eq 1) { $dm = New-Object Disp+DEVMODE; $dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm); if ([Disp]::EnumDisplaySettings($dd.DeviceName, -1, [ref]$dm)) { if ($dm.dmPelsWidth -gt 0) { $num = ($dd.DeviceName -replace '[^0-9]',''); "DSP|$num|$($dm.dmPelsWidth)|$($dm.dmPelsHeight)|$($dm.dmDisplayFrequency)|$($dm.dmDisplayOrientation)" } } } } }
 """
-        for line in _run_ps(ps_enum).splitlines():
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
-                hz = parts[3] if parts[3].isdigit() and int(parts[3]) > 0 else ""
-                out.append({
-                    "name": f"Monitor {parts[0]}", "gpu": gpu_name,
-                    "res": f"{parts[1]}x{parts[2]}", "hz": hz,
-                })
-        # 2. Fallback AllScreens
+
+_PS_ALL_SCREENS = (
+    "[System.Windows.Forms.Screen]::AllScreens | "
+    "ForEach-Object { \"$($_.DeviceName)|$($_.Bounds.Width)|"
+    "$($_.Bounds.Height)|$($_.Primary)\" }"
+)
+
+_PS_EDID = r"""
+Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
+  $man = (($_.ManufacturerName | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
+  $fr = (($_.UserFriendlyName | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
+  $ser = (($_.SerialNumberID | ForEach-Object {[char]$_}) -join '').Trim([char]0).Trim()
+  "$($_.InstanceName)|$man|$fr|$ser"
+}
+"""
+
+_PS_PORTS_RAW = (
+    "Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorConnectionParams "
+    "-ErrorAction SilentlyContinue | ForEach-Object { \"$($_.InstanceName)|$($_.VideoOutputTechnology)\" }"
+)
+
+_PS_PNP_RAW = (
+    "Get-CimInstance Win32_DesktopMonitor -ErrorAction SilentlyContinue | "
+    "ForEach-Object { \"$($_.PNPDeviceID)|$($_.DeviceID)\" }"
+)
+
+
+# --- Patch 5.1 perc216: enumerasi monitor via ctypes (tanpa PowerShell) ---
+# Struktur Win32 versi Unicode (W). WCHAR = 2 byte di Windows, tapi
+# ctypes.c_wchar = 4 byte di Linux — karena itu field WCHAR didefinisikan
+# sebagai c_uint16 (selalu 2 byte) supaya layout-nya PERSIS seperti
+# Win32 di semua platform dan bisa diuji di Linux. Alasan yang sama:
+# DWORD/LONG Win32 = 4 byte, jadi dipakai c_uint32/c_int32 (bukan
+# c_ulong/c_long yang 8 byte di Linux LP64). Ukuran yang benar:
+# DEVMODEW = 220 byte (bukan 156 — itu DEVMODEA/ANSI), DISPLAY_DEVICEW
+# = 840 byte (bukan 424 — itu versi ANSI). Offset kunci (W):
+# dmDisplayOrientation 84, dmPelsWidth 172, dmPelsHeight 176,
+# dmDisplayFlags 180, dmDisplayFrequency 184. ctypes menghitung offset
+# dari _fields_, jadi tidak ada angka yang di-hardcode di sini.
+def _wstr(a):
+    """Decode array c_uint16 (UTF-16LE, NUL-terminated) -> str."""
+    try:
+        return bytes(a).decode("utf-16-le", "ignore").split(chr(0))[0]
+    except Exception:
+        return ""
+
+
+class _DEVMODE_W(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", ctypes.c_uint16 * 32),
+        ("dmSpecVersion", ctypes.c_uint16),
+        ("dmDriverVersion", ctypes.c_uint16),
+        ("dmSize", ctypes.c_uint16),
+        ("dmDriverExtra", ctypes.c_uint16),
+        ("dmFields", ctypes.c_uint32),
+        ("dmPositionX", ctypes.c_int32),
+        ("dmPositionY", ctypes.c_int32),
+        ("dmDisplayOrientation", ctypes.c_uint32),
+        ("dmDisplayFixedOutput", ctypes.c_uint32),
+        ("dmColor", ctypes.c_int16),
+        ("dmDuplex", ctypes.c_int16),
+        ("dmYResolution", ctypes.c_int16),
+        ("dmTTOption", ctypes.c_int16),
+        ("dmCollate", ctypes.c_int16),
+        ("dmFormName", ctypes.c_uint16 * 32),
+        ("dmLogPixels", ctypes.c_uint16),
+        ("dmBitsPerPel", ctypes.c_uint32),
+        ("dmPelsWidth", ctypes.c_uint32),
+        ("dmPelsHeight", ctypes.c_uint32),
+        ("dmDisplayFlags", ctypes.c_uint32),
+        ("dmDisplayFrequency", ctypes.c_uint32),
+        ("dmICMMethod", ctypes.c_uint32),
+        ("dmICMIntent", ctypes.c_uint32),
+        ("dmMediaType", ctypes.c_uint32),
+        ("dmDitherType", ctypes.c_uint32),
+        ("dmReserved1", ctypes.c_uint32),
+        ("dmReserved2", ctypes.c_uint32),
+        ("dmPanningWidth", ctypes.c_uint32),
+        ("dmPanningHeight", ctypes.c_uint32),
+    ]
+
+
+class _DISPLAY_DEVICE_W(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("DeviceName", ctypes.c_uint16 * 32),
+        ("DeviceString", ctypes.c_uint16 * 128),
+        ("StateFlags", ctypes.c_uint32),
+        ("DeviceID", ctypes.c_uint16 * 128),
+        ("DeviceKey", ctypes.c_uint16 * 128),
+    ]
+
+
+def _monitors_ctypes():
+    """Enumerasi display aktif via ctypes user32 (Windows saja).
+
+    Jalur utama perc216: EnumDisplayDevicesW + EnumDisplaySettingsW
+    langsung dari Python — tanpa PowerShell, tanpa kompilasi Add-Type
+    C# (yang di PC user mengembalikan kosong di perc215, sehingga
+    hanya display utama yang terdeteksi lewat fallback VideoController).
+    Kembalikan (daftar, info): daftar berbentuk sama seperti langkah 1
+    _monitors() lama, ditambah "device_id" per entri untuk pairing
+    EDID; info = {"attached": n, "error": ""}.
+    """
+    info = {"attached": 0, "error": ""}
+    out = []
+    if not IS_WIN:
+        info["error"] = "bukan windows"
+        return out, info
+    try:
+        user32 = ctypes.windll.user32
+        user32.EnumDisplayDevicesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32,
+                                               ctypes.POINTER(_DISPLAY_DEVICE_W), ctypes.c_uint32]
+        user32.EnumDisplayDevicesW.restype = ctypes.c_int
+        user32.EnumDisplaySettingsW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32,
+                                                ctypes.POINTER(_DEVMODE_W)]
+        user32.EnumDisplaySettingsW.restype = ctypes.c_int
+        for i in range(10):
+            dd = _DISPLAY_DEVICE_W()
+            dd.cb = ctypes.sizeof(_DISPLAY_DEVICE_W)
+            if not user32.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+                continue
+            if not (dd.StateFlags & 1):
+                continue
+            info["attached"] += 1
+            name = _wstr(dd.DeviceName)
+            num = "".join(ch for ch in name if ch.isdigit())
+            entry = {"name": "Monitor " + (num or str(len(out) + 1)),
+                     "num": int(num) if num.isdigit() else len(out) + 1,
+                     "res": "", "hz": "", "orient": 0,
+                     "device_id": _wstr(dd.DeviceID)}
+            dm = _DEVMODE_W()
+            dm.dmSize = ctypes.sizeof(_DEVMODE_W)
+            # ENUM_CURRENT_SETTINGS = (DWORD)-1 = 0xFFFFFFFF
+            if user32.EnumDisplaySettingsW(name, 0xFFFFFFFF, ctypes.byref(dm)):
+                if dm.dmPelsWidth > 0 and dm.dmPelsHeight > 0:
+                    entry["res"] = "%dx%d" % (dm.dmPelsWidth, dm.dmPelsHeight)
+                if dm.dmDisplayFrequency > 0:
+                    entry["hz"] = str(dm.dmDisplayFrequency)
+                entry["orient"] = int(dm.dmDisplayOrientation)
+            out.append(entry)
+    except Exception as e:
+        info["error"] = str(e) or e.__class__.__name__
+    return out, info
+
+
+def _monitors():
+    """Scan monitor maks. 4, Windows saja. Di-cache 60 detik.
+
+    Cara lama (Win32_VideoController) hanya mengembalikan 1 baris per GPU,
+    jadi monitor ke-2/3/4 yang menempel di GPU yang sama tidak pernah
+    muncul. Karena itu sekarang dipakai, berurutan:
+    1. ctypes user32 (perc216, UTAMA): EnumDisplayDevicesW +
+       EnumDisplaySettingsW langsung dari Python -> resolusi DAN
+       refresh rate per monitor yang sebenarnya, bukan per GPU.
+       Gagal total -> fallback script PowerShell 215 (timeout 20 dtk).
+    2. Fallback: [System.Windows.Forms.Screen]::AllScreens -> jumlah dan
+       resolusi tiap layar, refresh rate diambil dari VideoController.
+    3. Fallback terakhir: Win32_VideoController (1 monitor per GPU).
+    Sumber langkah yang membangun daftar disimpan di _monitor_cache[2]
+    (enum_source) dan dilaporkan /api/monitors_debug.
+    Nama GPU diambil dari VideoController pertama dan dipakai untuk
+    semua monitor, karena semua monitor itu biasanya di GPU yang sama.
+    """
+    global _monitor_cache
+    now = time.time()
+    if now - _monitor_cache[1] < 60 and _monitor_cache[0]:
+        return _monitor_cache[0]
+    out = []
+    enum_source = ""
+    if IS_WIN:
+        gpu_name = ""
+        txt_gpu = _run_ps(
+            "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
+            "Select-Object -First 1 -ExpandProperty Name"
+        ).strip()
+        if txt_gpu:
+            gpu_name = txt_gpu.splitlines()[0].strip()
+        # 1. ctypes user32 (Patch 5.1 perc216: jalur UTAMA — tanpa
+        # PowerShell/Add-Type; di PC user script 215 mengembalikan kosong,
+        # sehingga hanya display utama yang terdeteksi).
+        ctypes_out, ctypes_info = _monitors_ctypes()
+        _monitor_ctypes_info.update(ctypes_info)
+        if ctypes_out:
+            enum_source = "ctypes"
+            for _m in ctypes_out:
+                _m["gpu"] = gpu_name
+            out.extend(ctypes_out)
+        else:
+            # 1b. EnumDisplayDevices + EnumDisplaySettings via PowerShell
+            # (cadangan 215: daftar device + StateFlags dulu, lalu
+            # settings per device yang ter-attach; orientasi DEVMODE
+            # ikut dibaca. Timeout 20 dtk — 10 dtk terbukti tidak cukup /
+            # gagal diam-diam di PC user.)
+            enum_txt = _run_ps(_PS_ENUM_DISPLAYS, timeout=20)
+            for line in enum_txt.splitlines():
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 6 and parts[0] == "DSP" and parts[2].isdigit() and parts[3].isdigit():
+                    hz = parts[4] if parts[4].isdigit() and int(parts[4]) > 0 else ""
+                    try:
+                        orient = int(parts[5]) if parts[5].lstrip("-").isdigit() else 0
+                    except (TypeError, ValueError):
+                        orient = 0
+                    out.append({
+                        "name": f"Monitor {parts[1]}", "gpu": gpu_name, "num": int(parts[1]) if parts[1].isdigit() else len(out)+1,
+                        "res": f"{parts[2]}x{parts[3]}", "hz": hz, "orient": orient,
+                    })
+            if out:
+                enum_source = "powershell"
+        # 2. AllScreens — LENGKAPI display aktif yang lolos dari langkah 1
+        # (bukan lagi hanya fallback saat out kosong). Resolusi dari
+        # Bounds; Hz kosong bila EnumDisplaySettings tidak mengembalikan
+        # display itu (alasan pastinya terlihat di /api/monitors_debug).
+        # Bila out masih kosong, Hz diambil dari VideoController seperti dulu.
+        hz_fallback = ""
         if not out:
-            txt_screens = _run_ps(
-                "[System.Windows.Forms.Screen]::AllScreens | "
-                "ForEach-Object { \"$($_.DeviceName)|$($_.Bounds.Width)|"
-                "$($_.Bounds.Height)|$($_.Primary)\" }"
-            )
-            hz_fallback = ""
             txt_vc = _run_ps(
                 "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
                 "Select-Object -First 1 -ExpandProperty CurrentRefreshRate"
             ).strip()
             if txt_vc and txt_vc.splitlines()[0].strip().isdigit():
                 hz_fallback = txt_vc.splitlines()[0].strip()
-            for line in txt_screens.splitlines():
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 3 and parts[1].isdigit():
-                    num = "".join(ch for ch in parts[0] if ch.isdigit()) or str(len(out) + 1)
-                    primary = len(parts) >= 4 and parts[3].lower() == "true"
-                    out.append({
-                        "name": f"Monitor {num}" + (" (Utama)" if primary else ""),
-                        "gpu": gpu_name,
-                        "res": f"{parts[1]}x{parts[2]}", "hz": hz_fallback,
-                    })
+        _have_nums = {m.get("num") for m in out}
+        _added_screens = False
+        for line in _run_ps(_PS_ALL_SCREENS, timeout=10).splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 3 and parts[1].isdigit():
+                num = "".join(ch for ch in parts[0] if ch.isdigit()) or str(len(out) + 1)
+                _n = int(num) if str(num).isdigit() else len(out) + 1
+                if _n in _have_nums:
+                    continue
+                primary = len(parts) >= 4 and parts[3].lower() == "true"
+                out.append({
+                    "name": f"Monitor {num}" + (" (Utama)" if primary else ""),
+                    "gpu": gpu_name, "num": _n,
+                    "res": f"{parts[1]}x{parts[2]}", "hz": hz_fallback, "orient": 0,
+                })
+                _have_nums.add(_n)
+                _added_screens = True
+        if _added_screens and not enum_source:
+            enum_source = "allscreens"
         # 3. Fallback VideoController
         if not out:
             txt = _run_ps(
@@ -876,28 +1177,165 @@ for ($i=1; $i -le 10; $i++) { $dm = New-Object Disp+DEVMODE; $dm.dmSize = [Syste
                 parts = [p.strip() for p in line.split("|")]
                 if len(parts) >= 4 and parts[1].isdigit():
                     out.append({
-                        "name": f"Monitor {i}", "gpu": parts[0],
-                        "res": f"{parts[1]}x{parts[2]}", "hz": parts[3],
+                        "name": f"Monitor {i}", "gpu": parts[0], "num": i,
+                        "res": f"{parts[1]}x{parts[2]}", "hz": parts[3], "orient": 0,
                     })
-    # Batas maks. 4 monitor (permintaan user 2026-11-03): apa pun yang
-    # terdeteksi lebih dari itu (mis. layar virtual) tidak ditampilkan
-    # dan tidak dihitung ke daya monitor.
-    out = out[:4]
+            if out and not enum_source:
+                enum_source = "videocontroller"
     if out:
         brands = _monitor_brands()
-        ports = _monitor_ports()
+        port_list = _monitor_ports()
+        port_map = {}
+        port_order = []
+        tech_map = {}
+        tech_order = []
+        for _pd in port_list:
+            _inst = (_pd.get("instance") or "").upper()
+            if _inst:
+                port_map[_inst] = _pd.get("port", "")
+                tech_map[_inst] = _pd.get("tech")
+            port_order.append(_pd.get("port", ""))
+            tech_order.append(_pd.get("tech"))
+        pnp_map = _monitor_pnp_map()
+        paired = {}
+        used = set()
+        # 0) Pasangkan EDID <-> display aktif lewat DeviceID
+        # EnumDisplayDevices (perc216) — formatnya sama persis dengan
+        # InstanceName EDID. Jalur ini yang menyelamatkan Lenovo,
+        # karena pnp_map terbukti hanya berisi MSI (Win32_DesktopMonitor
+        # tidak mengembalikan monitor kedua di PC user).
         for i, mon in enumerate(out):
-            if i < len(brands) and brands[i].get("display"):
-                mon["name"] = brands[i]["display"]
-                mon["brand"] = brands[i].get("brand", "")
-                mon["model"] = brands[i].get("model", "")
+            dev_id = (mon.get("device_id") or "").upper()
+            if not dev_id:
+                continue
+            for j, b in enumerate(brands):
+                if j in used:
+                    continue
+                inst = (b.get("instance") or "").upper()
+                if inst and inst == dev_id:
+                    paired[i] = j
+                    used.add(j)
+                    break
+        # 1) Pasangkan EDID <-> display aktif lewat PNPDeviceID/DeviceID.
+        for i, mon in enumerate(out):
+            num = mon.get("num")
+            if not num:
+                continue
+            for j, b in enumerate(brands):
+                if j in used:
+                    continue
+                inst = (b.get("instance") or "").upper()
+                if not inst:
+                    continue
+                if pnp_map.get(inst) == num:
+                    paired[i] = j
+                    used.add(j)
+                    break
+                # Fallback kode model (segmen setelah DISPLAY\) bila unik:
+                # cocokkan kode model EDID dengan kunci pnp_map (bukan
+                # dengan sesama EDID — itu selalu cocok dan akan
+                # memasangkan merek pertama ke display pertama apa pun
+                # urutannya). Hanya pasang bila SATU entri PNP berkode
+                # itu dan nomor DISPLAY-nya sama dengan monitor ini.
+                _seg = inst.split("\\")
+                _code = _seg[1] if len(_seg) > 1 else ""
+                if _code:
+                    _pnp_nums = {v for k, v in pnp_map.items()
+                                 if k.split("\\")[1:2] == [_code]}
+                    if _pnp_nums == {num}:
+                        paired[i] = j
+                        used.add(j)
+                        break
+        # 2) Fallback urutan seperti sebelumnya untuk yang belum terpasang.
+        for i, mon in enumerate(out):
+            if i in paired:
+                continue
+            for j, b in enumerate(brands):
+                if j not in used:
+                    paired[i] = j
+                    used.add(j)
+                    break
+        for i, mon in enumerate(out):
+            mon["active"] = True
+            j = paired.get(i)
+            if j is not None and brands[j].get("display"):
+                mon["name"] = brands[j]["display"]
+                mon["brand"] = brands[j].get("brand", "")
+                mon["model"] = brands[j].get("model", "")
+                _inst = (brands[j].get("instance") or "").upper()
+                mon["port"] = port_map.get(_inst) or (port_order[j] if j < len(port_order) else "")
+                mon["tech"] = tech_map.get(_inst, tech_order[j] if j < len(tech_order) else None)
             else:
                 mon["brand"] = ""
                 mon["model"] = ""
-            mon["port"] = ports[i] if i < len(ports) else ""
-    _monitor_cache = (out, now)
+                mon["port"] = port_order[i] if i < len(port_order) else ""
+                mon["tech"] = tech_order[i] if i < len(tech_order) else None
+        # 3) Monitor EDID yang tidak punya display aktif = NONAKTIF
+        # (tercolok tapi tidak dipakai Windows — mis. Lenovo L24i-30 user).
+        for j, b in enumerate(brands):
+            if j in used:
+                continue
+            if not b.get("display"):
+                continue
+            _inst = (b.get("instance") or "").upper()
+            out.append({
+                "name": b["display"], "gpu": gpu_name, "res": "", "hz": "",
+                "brand": b.get("brand", ""), "model": b.get("model", ""),
+                "port": port_map.get(_inst) or (port_order[j] if j < len(port_order) else ""),
+                "tech": tech_map.get(_inst, tech_order[j] if j < len(tech_order) else None),
+                "orient": 0, "active": False,
+            })
+    # Batas maks. 4 monitor (permintaan user 2026-11-03): aktif dulu,
+    # lalu nonaktif; lebih dari itu tidak ditampilkan dan tidak dihitung
+    # ke daya monitor.
+    out = out[:4]
+    _monitor_cache = (out, now, enum_source)
     return out
 
+
+def _monitors_debug():
+    """Diagnostik mentah deteksi monitor (Patch 5.1 perc215, diperluas 216).
+
+    Dipakai memastikan apa yang dilihat server bila sebuah monitor
+    tampil Nonaktif padahal aktif di Windows: kembalikan output MENTAH
+    tiap probe (EDID, PNP map, EnumDisplayDevices/Settings, AllScreens,
+    ConnectionParams + nilai VideoOutputTechnology ANGKA), hasil pairing
+    (_monitors()), dan umur cache. Di luar Windows -> probe kosong.
+    Perc216: tiap probe PowerShell kini menampilkan stdout + stderr +
+    return code + waktu tempuh (via _run_ps_full — di 215 stderr dibuang
+    diam-diam, jadi kegagalan probe tidak bisa dibuktikan); tambah
+    enum_source (jalur yang membangun daftar monitors saat ini) dan
+    ctypes_result (hasil scan ctypes terakhir).
+    """
+    now = time.time()
+    if IS_WIN:
+        _t = time.time()
+        enum_out, enum_err, enum_rc = _run_ps_full(_PS_ENUM_DISPLAYS, timeout=20)
+        enum_secs = round(time.time() - _t, 2)
+        _t = time.time()
+        scr_out, scr_err, scr_rc = _run_ps_full(_PS_ALL_SCREENS, timeout=10)
+        scr_secs = round(time.time() - _t, 2)
+        edid_txt = _run_ps(_PS_EDID)
+        ports_txt = _run_ps(_PS_PORTS_RAW)
+        pnp_txt = _run_ps(_PS_PNP_RAW)
+    else:
+        enum_out = enum_err = scr_out = scr_err = ""
+        enum_rc = scr_rc = 0
+        enum_secs = scr_secs = 0.0
+        edid_txt = ports_txt = pnp_txt = ""
+    mons = _monitors()
+    enum_source = _monitor_cache[2] if len(_monitor_cache) > 2 else ""
+    cache_age = round(time.time() - _monitor_cache[1], 1) if _monitor_cache[1] else None
+    return {"ok": True, "is_win": bool(IS_WIN),
+            "enum_raw": enum_out, "screens_raw": scr_out,
+            "enum_ps": {"out": enum_out, "err": enum_err, "rc": enum_rc, "secs": enum_secs},
+            "screens_ps": {"out": scr_out, "err": scr_err, "rc": scr_rc, "secs": scr_secs},
+            "enum_source": enum_source,
+            "ctypes_result": dict(_monitor_ctypes_info),
+            "edid_raw": edid_txt, "edid_parsed": _parse_monitor_brands(edid_txt),
+            "ports_raw": ports_txt, "ports_parsed": _monitor_ports(),
+            "pnp_raw": pnp_txt, "pnp_map": _monitor_pnp_map(),
+            "monitors": mons, "cache_age_s": cache_age}
 
 _app_icon_cache = {"exe": "", "png": None}
 _active_app_cache = {"data": None, "time": 0.0}
@@ -1447,6 +1885,7 @@ def _gsmtc_winrt():
                 best = line
         return best_playing if best_playing is not None else best
 
+    import asyncio  # perc209: lazy — asyncio hanya dipakai GSMTC
     try:
         raw = asyncio.run(asyncio.wait_for(_query(), timeout=10))
     except Exception as e:
@@ -1565,6 +2004,7 @@ def _gsmtc_thumbnail_winrt():
         except Exception:
             return None
 
+    import asyncio  # perc209: lazy — asyncio hanya dipakai GSMTC
     try:
         raw = asyncio.run(asyncio.wait_for(_query(), timeout=10))
     except Exception:
@@ -2123,6 +2563,145 @@ def _save_power(data):
         return False
 
 
+
+# Patch 5.1 perc210 — pengaturan Sistem (Close to tray / Start on login /
+# Start minimized to tray, seperti SYSTEM Nocturne). Disimpan di file JSON
+# sepola power.json (APPDATA\PCMonitorHUD di Windows) supaya dibaca server
+# DAN launcher (kisa_app.py) dari satu sumber. start_on_login TIDAK di file —
+# dibaca dari registry Run (state benar), karena registry yang menentukan.
+_SYS_SETTINGS_DEFAULTS = {"close_to_tray": True, "start_minimized": True}
+
+
+def _sys_settings_path():
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return Path(base) / "PCMonitorHUD" / "settings.json"
+    return Path(os.path.expanduser("~")) / ".pc_monitor_hud" / "settings.json"
+
+
+def _sys_settings_load():
+    try:
+        data = json.loads(_sys_settings_path().read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            out = dict(_SYS_SETTINGS_DEFAULTS)
+            for k in _SYS_SETTINGS_DEFAULTS:
+                if k in data:
+                    out[k] = bool(data[k])
+            return out
+    except Exception:
+        pass
+    return dict(_SYS_SETTINGS_DEFAULTS)
+
+
+def _sys_settings_save(patch):
+    try:
+        cur = _sys_settings_load()
+        for k in _SYS_SETTINGS_DEFAULTS:
+            if k in patch:
+                cur[k] = bool(patch[k])
+        p = _sys_settings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cur), encoding="utf-8")
+        return cur
+    except Exception:
+        return None
+
+
+def _sys_autostart_target():
+    """Target yang didaftarkan ke Registry Run untuk auto-start
+    (Patch 5.1 perc215 FIX: dulu hanya .exe terinstal).
+
+    .exe terinstal (frozen) -> path KISA.exe; versi .bat -> path
+    Jalankan_di_PC.bat di folder server ini (BASE_DIR). Selain Windows
+    atau target tidak ada -> "" (auto-start tidak didukung).
+    """
+    if sys.platform != "win32":
+        return ""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    bat = BASE_DIR / "Jalankan_di_PC.bat"
+    return str(bat) if bat.is_file() else ""
+
+
+def _sys_autostart_mode():
+    """Mode auto-start: 'exe' | 'bat' | 'none' (untuk dashboard)."""
+    if sys.platform != "win32":
+        return "none"
+    if getattr(sys, "frozen", False):
+        return "exe"
+    return "bat" if (BASE_DIR / "Jalankan_di_PC.bat").is_file() else "none"
+
+
+def _sys_autostart_value(target, minimized, frozen):
+    """Nilai Registry Run untuk auto-start. Pure (bisa di-unit-test).
+
+    .exe: "<exe>" [--tray]; .bat: "<bat>" atau
+    cmd /c start "KISA Server" /min "<bat>" --minimized (jendela launcher
+    + jendela server sama-sama minimized; .bat menangani --minimized).
+    """
+    if frozen:
+        return '"%s" --tray' % target if minimized else '"%s"' % target
+    if minimized:
+        return 'cmd /c start "KISA Server" /min "%s" --minimized' % target
+    return '"%s"' % target
+
+
+def _sys_autostart_supported():
+    return sys.platform == "win32" and bool(_sys_autostart_target())
+
+
+def _sys_autostart_get():
+    if not _sys_autostart_supported():
+        return False
+    tgt = _sys_autostart_target()
+    if not tgt:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run",
+                            0, winreg.KEY_QUERY_VALUE) as key:
+            val, _ = winreg.QueryValueEx(key, "KISA")
+        # ON hanya bila value menunjuk ke target folder SAAT INI dan
+        # targetnya masih ada (entri lama dari folder yang dipindah
+        # atau dihapus -> OFF; saat user menyalakan, ditulis ulang).
+        return bool(val) and tgt.lower() in str(val).lower() and os.path.isfile(tgt)
+    except Exception:
+        return False
+
+
+def _sys_autostart_set(enable, minimized=True):
+    if not _sys_autostart_supported():
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run",
+                            0, winreg.KEY_SET_VALUE) as key:
+            if enable:
+                val = _sys_autostart_value(_sys_autostart_target(), minimized,
+                                           getattr(sys, "frozen", False))
+                winreg.SetValueEx(key, "KISA", 0, winreg.REG_SZ, val)
+            else:
+                try:
+                    winreg.DeleteValue(key, "KISA")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def _sys_settings_state():
+    st = _sys_settings_load()
+    return {"ok": True,
+            "supported": sys.platform == "win32",
+            "autostart_available": _sys_autostart_supported(),
+            "autostart_mode": _sys_autostart_mode(),
+            "close_to_tray": bool(st.get("close_to_tray", True)),
+            "start_on_login": bool(_sys_autostart_get()),
+            "start_minimized": bool(st.get("start_minimized", True))}
+
 def _cpu_tdp(model):
     m = (model or "").lower()
     if "ryzen 9" in m or "ryzen 9 " in m:
@@ -2182,6 +2761,16 @@ def _estimate_watts(cpu_pct, gpu_util, cpu_model, gpu_name, monitor_count):
             "cpu_tdp": cpu_tdp, "gpu_tdp": gpu_tdp}
 
 
+def _count_active_monitors(mons=None):
+    """Jumlah monitor AKTIF saja (untuk daya) — monitor nonaktif (tercolok
+    tapi tidak dipakai Windows) tidak dihitung ke daya monitor."""
+    try:
+        lst = mons if mons is not None else _monitors()
+        return sum(1 for m in lst if m.get("active", True))
+    except Exception:
+        return 0
+
+
 def _accumulate_power(cpu_pct=None, gpu_util=None, cpu_model=None, gpu_name=None, monitor_count=0):
     """Tambah energi (kWh) berdasarkan daya saat ini dan waktu sejak
     hitungan terakhir. Dipanggil tiap tick dashboard dan tiap 10 detik
@@ -2223,7 +2812,7 @@ def _accumulate_power(cpu_pct=None, gpu_util=None, cpu_model=None, gpu_name=None
                 gpu_name = ""
         if monitor_count == 0:
             try:
-                monitor_count = len(_monitors())
+                monitor_count = _count_active_monitors()
             except Exception:
                 monitor_count = 0
     est = _estimate_watts(cpu_pct, gpu_util, cpu_model, gpu_name, monitor_count)
@@ -2398,7 +2987,8 @@ def _ping_ms(host):
     """Ping ICMP (ping.exe Windows / ping Linux), rata-rata ms, atau None."""
     try:
         cmd = ["ping", "-n", "4", host] if IS_WIN else ["ping", "-c", "4", "-W", "2", host]
-        out = subprocess.check_output(cmd, timeout=15, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="ignore")
+        out = subprocess.check_output(cmd, timeout=15, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="ignore",
+                              creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     except Exception:
         return None
     m = re.search(r"(?:Average|Rata-rata)\s*=\s*(\d+)", out)
@@ -2483,24 +3073,165 @@ def _fps_off():
             "error": "", "game_exe": "", "game_duration": 0, "game_icon": False}
 
 
+# Patch 5.1 (perc206): stale-while-revalidate — cache collect() boleh
+# dipakai sampai 10 detik sambil refresh penuh jalan di latar, supaya
+# /api/data pertama kembali <1 detik walau collect sedang dingin
+# (LHM/GSMTC/PowerShell). Refresh latar single-flight: tidak pernah ada
+# dua _collect_inner yang jalan bersamaan.
+_COLLECT_FRESH_S = 1.0
+_COLLECT_STALE_S = 10.0
+_collect_refresh_lock = threading.Lock()
+
+
+def _collect_refresh_bg(skip):
+    """Refresh penuh di thread latar. Tidak pernah melempar: bila gagal,
+    cache lama tetap dipakai dan poll berikutnya mencoba lagi."""
+    if not _collect_refresh_lock.acquire(blocking=False):
+        return
+    try:
+        with _collect_lock:
+            _collect_inner(skip)
+    except Exception as e:
+        print(f"[KISA] refresh collect latar gagal: {e}", flush=True)
+    finally:
+        _collect_refresh_lock.release()
+
+
+def _trigger_collect_refresh(skip):
+    """Mulai _collect_refresh_bg (no-op bila refresh sudah jalan)."""
+    try:
+        threading.Thread(target=_collect_refresh_bg, args=(skip,),
+                         daemon=True, name="kisa-collect-refresh").start()
+    except Exception:
+        pass
+
+
+def _collect_fast(skip):
+    """Snapshot CEPAT (jalur cepat, perc206): hanya psutil — CPU/RAM/disk/
+    jaringan/waktu + estimasi daya dari nilai cache. TIDAK memanggil LHM,
+    nvidia-smi, PowerShell, GSMTC, FPS, monitor, atau WiFi, jadi kembali
+    dalam puluhan ms. Bentuk dict SAMA PERSIS dengan _collect_inner (kunci
+    sama; bagian lambat berisi nilai kosong/default seperti pada Mode
+    Super Ringan) supaya dashboard langsung terisi dan data lambat menyusul
+    lewat refresh latar di poll berikut. TIDAK ditulis ke _collect_cache
+    supaya tidak menimpa hasil penuh yang baru saja disimpan refresh latar.
+    """
+    global _prev_net, _prev_time
+    now = time.time()
+    cpu = psutil.cpu_percent(interval=None)
+    per_core = psutil.cpu_percent(interval=None, percpu=True)
+    try:
+        freq = psutil.cpu_freq()
+        freq_mhz = round(freq.current) if freq else None
+    except Exception:
+        freq_mhz = None
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    net = psutil.net_io_counters()
+    if _prev_net is None:
+        up_mbps = down_mbps = 0.0
+    else:
+        dt = max(now - _prev_time, 0.001)
+        up_mbps = round((net.bytes_sent - _prev_net.bytes_sent) / dt / 1024 / 1024 * 8, 2)
+        down_mbps = round((net.bytes_recv - _prev_net.bytes_recv) / dt / 1024 / 1024 * 8, 2)
+    _prev_net, _prev_time = net, now
+    disks = []
+    win_types = _disk_types_windows() if IS_WIN else None
+    for p in psutil.disk_partitions(all=False):
+        try:
+            u = psutil.disk_usage(p.mountpoint)
+        except Exception:
+            continue
+        if IS_WIN:
+            letter = p.device[0].upper() if len(p.device) >= 2 and p.device[1] == ":" else None
+            dtype = win_types.get(letter) if letter else None
+        else:
+            dtype = _linux_disk_type(p.device)
+        disks.append({
+            "device": p.device, "mount": p.mountpoint,
+            "total_gb": _gb(u.total), "used_gb": _gb(u.used),
+            "free_gb": _gb(u.free), "percent": round(u.percent, 1),
+            "type": dtype,
+        })
+    boot = psutil.boot_time()
+    uptime_s = int(now - boot)
+    # _power_info dengan argumen eksplisit (model cache, gpu "", monitor
+    # terakhir) supaya _accumulate_power TIDAK memanggil fallback berat.
+    _pow = _power_info(cpu, None, _cpu_model_cache[0], "", _ULTRA_MONITORS)
+    return {
+        "time": time.strftime("%H:%M:%S"),
+        "host": platform.node(),
+        "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        "cpu": {
+            "percent": round(cpu, 1), "cores": psutil.cpu_count(logical=False),
+            "threads": psutil.cpu_count(logical=True), "freq_mhz": freq_mhz,
+            "per_core": [round(x, 1) for x in per_core], "temp_c": None,
+            "model": _cpu_model_cache[0],
+        },
+        "ram": {
+            "percent": round(mem.percent, 1), "total_gb": _gb(mem.total),
+            "used_gb": _gb(mem.used), "free_gb": _gb(mem.available),
+            "swap_percent": round(swap.percent, 1),
+        },
+        "disks": disks,
+        "network": {
+            "up_mbps": up_mbps, "down_mbps": down_mbps,
+            "sent_gb": _gb(net.bytes_sent), "recv_gb": _gb(net.bytes_recv),
+        },
+        "wifi": None,
+        "gpu": [],
+        "gpu_util": None, "gpu_temp_c": None,
+        "temps": [],
+        "lhm_status": "off" if "ultra" in skip else _lhm_status,
+        "lhm_host": "" if "ultra" in skip else _lhm_host,
+        "top_processes": [],
+        "monitors": [],
+        "active_app": None,
+        "recent_apps": [],
+        "now_playing": _now_playing_cache[0],
+        "fps": _fps_off(),
+        "fans_mobo": {"fans": [], "mobo_name": "", "mobo_temps": []},
+        "power": _pow,
+        "uptime": {"hours": uptime_s // 3600, "minutes": (uptime_s % 3600) // 60},
+        "timings_ms": {"psutil": 0, "network_storage": 0, "lhm": 0, "system": 0,
+                       "fans": 0, "now_playing": 0, "fps": 0, "power": 0, "total": 0},
+    }
+
+
 def collect(skip=None):
     """Kumpulkan semua data dashboard.
 
     skip: frozenset/set berisi 'fps' dan/atau 'np' — bagian berat yang
     dilewati bila kartu terkait disembunyikan atau Mode Ringan aktif.
-    Hasil di-cache 1 detik per kunci skip (perc153): pada refresh 0,5 detik,
-    2 request hanya menghitung 1x — pemakaian CPU server turun ~setengah.
+    Patch 5.1 (perc206) stale-while-revalidate + jalur cepat/lambat:
+    - cache segar (<1 dtk) -> langsung kembali (seperti dulu, perc153);
+    - cache basi (<10 dtk) -> kembalikan cache basi SEGERA sambil refresh
+      penuh jalan di thread latar (single-flight);
+    - belum ada cache / sangat basi -> kembalikan snapshot cepat
+      (_collect_fast, hanya psutil, puluhan ms) sambil refresh penuh jalan
+      di latar. /api/data pertama TIDAK PERNAH menunggu collect dingin
+      (LHM/GSMTC/PowerShell) lagi; data lambat menyusul di poll berikut.
+    _collect_inner sendiri TIDAK diubah (nilai sensor & struktur dict sama).
     """
     skip = frozenset(skip or ())
     _ent = _collect_cache.get(skip)
-    if _ent is not None and time.time() - _ent[1] < 1.0:
+    _now = time.time()
+    if _ent is not None and _now - _ent[1] < _COLLECT_FRESH_S:
         return _ent[0]
-    with _collect_lock:
-        # Cek lagi: thread lain mungkin baru saja mengisi cache selagi menunggu.
-        _ent = _collect_cache.get(skip)
-        if _ent is not None and time.time() - _ent[1] < 1.0:
-            return _ent[0]
-        return _collect_inner(skip)
+    if _ent is not None and _now - _ent[1] < _COLLECT_STALE_S:
+        _trigger_collect_refresh(skip)
+        return _ent[0]
+    # Belum ada cache, atau cache sudah sangat basi (>10 dtk): jangan blokir.
+    _trigger_collect_refresh(skip)
+    if _ent is not None:
+        return _ent[0]
+    try:
+        return _collect_fast(skip)
+    except Exception:
+        # Snapshot cepat pun gagal (mis. psutil) -> terakhir: collect penuh
+        # sinkron seperti perilaku lama, supaya tetap ada data.
+        with _collect_lock:
+            return _collect_inner(skip)
 
 
 def _collect_inner(skip):
@@ -2600,7 +3331,7 @@ def _collect_inner(skip):
         _model = _cpu_model()
         _mons = _monitors()
         if _mons:
-            _ULTRA_MONITORS = len(_mons)
+            _ULTRA_MONITORS = _count_active_monitors(_mons)
         _aa = _active_app()
         _ra = _update_recent_apps(_aa)
         _wifi = _wifi_signal()
@@ -2612,7 +3343,7 @@ def _collect_inner(skip):
         _fps = _fps_dict() if "fps" not in skip else _fps_off()
         _timings["fps"] = int(round((time.perf_counter() - _t0) * 1000)); _t0 = time.perf_counter()
         _pow = _power_info(cpu, gpu_util, _model,
-                           gpus[0]["name"] if gpus else "", len(_mons))
+                           gpus[0]["name"] if gpus else "", _count_active_monitors(_mons))
         _timings["power"] = int(round((time.perf_counter() - _t0) * 1000))
     _timings["total"] = int(round((time.perf_counter() - _t_start) * 1000))
     # Patch 4.5: satu baris peringatan kalau satu collect melewati 2 detik,
@@ -3258,7 +3989,7 @@ def _update_install(asset_name):
         # terkunci saat installer mengganti KISA.exe.
         try:
             subprocess.Popen([path],
-                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | (subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0))
         except Exception:
             try:
                 os.startfile(path)
@@ -3655,7 +4386,8 @@ def _lhm_restart_with_webserver(lhm_exe):
         import subprocess as _sp
         try:
             _sp.run(["taskkill", "/IM", "LibreHardwareMonitor.exe"],
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=15)
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=15,
+                    creationflags=_sp.CREATE_NO_WINDOW if os.name == "nt" else 0)
         except Exception:
             pass
         for _ in range(16):
@@ -4564,7 +5296,8 @@ def _bg_comp_run(cmd, prog_path, err_path, dur, job, in_size, engine):
     except Exception:
         err_fh = subprocess.DEVNULL
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_fh)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_fh,
+                              creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     except Exception:
         try:
             if err_fh is not subprocess.DEVNULL:
@@ -4665,6 +5398,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, body, ctype, extra=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
+        # Patch 5.1 perc209 (hemat transfer): gzip untuk respons teks
+        # (dashboard 1,3 MB -> ~300 KB) bila klien menerimanya. Gambar
+        # (sudah terkompresi) tidak di-gzip. Browser mengurai gzip
+        # transparan; klien tanpa Accept-Encoding: gzip dapat versi polos.
+        try:
+            _enc = self.headers.get("Accept-Encoding", "") or ""
+        except Exception:
+            _enc = ""
+        if "gzip" in _enc and len(data) > 1024 and (ctype.startswith("text/") or ctype.startswith("application/json")):
+            try:
+                import gzip  # lazy — modul kecil, hanya dipakai saat mengirim
+                data = gzip.compress(data, compresslevel=6)
+                extra = dict(extra or {})
+                extra["Content-Encoding"] = "gzip"
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -4679,27 +5428,34 @@ class Handler(BaseHTTPRequestHandler):
             html = (BASE_DIR / "dashboard.html").read_text(encoding="utf-8")
             self._send(html, "text/html; charset=utf-8")
         elif self.path == "/qr.png" or self.path.startswith("/qr.png?"):
-            _qr_ips = _local_ips()
-            _qr_ip = _qr_ips[0] if _qr_ips else None
+            # perc213: ?ip= (pilih manual dari popup) atau IP rute default.
+            _qs_qr = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _qr_ip = _qr_ip_for(_qs_qr)
             if (not _QR_PNG.exists()) or (_qr_ip is not None and _qr_ip != _QR_IP):
-                _dashboard_qr()
+                _dashboard_qr(_qr_ip)
             if _QR_PNG.exists():
                 self._send(_QR_PNG.read_bytes(), "image/png")
             else:
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"No QR")
-        elif self.path == "/api/qr_url":
+        elif self.path == "/api/qr_url" or self.path.startswith("/api/qr_url?"):
             # Patch 3.5: kembalikan URL dashboard (IP LAN + PORT) sebagai JSON
             # supaya popup QR di dashboard tidak perlu menebak alamat server.
-            _qru_ips = _local_ips()
-            _qru_ip = _qru_ips[0] if _qru_ips else None
+            # perc213: ?ip= untuk pilih IP manual dari popup; default IP rute default.
+            _qs_qru = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _qru_ip = _qr_ip_for(_qs_qru)
             if _qru_ip is not None and _qru_ip != _QR_IP:
-                _dashboard_qr()
+                _dashboard_qr(_qru_ip)
             if _qru_ip is not None:
                 self._send(json.dumps({"url": "http://%s:%d" % (_qru_ip, PORT)}), "application/json")
             else:
                 self._send(json.dumps({"url": None}), "application/json")
+        elif self.path == "/api/local_ips":
+            # Patch 5.1 perc213: semua IP lokal + IP utama, untuk popup QR.
+            _ips = _local_ips()
+            _prim = _primary_ip()
+            self._send(json.dumps({"ips": _ips, "primary": _prim}), "application/json")
         elif self.path == "/api/data" or self.path.startswith("/api/data?"):
             _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             _skip = set()
@@ -4778,6 +5534,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps(_install_support_status(_app or None), ensure_ascii=False).encode("utf-8"), "application/json")
             except Exception:
                 self._send(json.dumps({"ok": False, "error": "status_failed"}, ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/sys_settings":
+            self._send(json.dumps(_sys_settings_state(), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/monitors_debug":
+            self._send(json.dumps(_monitors_debug(), ensure_ascii=False).encode("utf-8"), "application/json")
         elif self.path == "/api/installed_version" or self.path.startswith("/api/installed_version?"):
             # Patch 5.0 (S174 Cara 3): versi terpasang DARI FILE dashboard.html
             # di disk (bukan konstanta proses) — ringan, tanpa cek GitHub.
@@ -4854,7 +5614,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _now_playing_cache, _gsmtc_cache, _fallback_cache
-        if self.path == "/api/power":
+        if self.path == "/api/sys_settings":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            saved = _sys_settings_save(body)
+            if saved is None:
+                self._send(json.dumps({"ok": False, "error": "save_failed"}, ensure_ascii=False).encode("utf-8"), "application/json")
+            elif "start_on_login" in body:
+                # tulis/hapus entri Run; bila tidak didukung (Linux /
+                # target tidak ada), kembalikan error khusus —
+                # close_to_tray/start_minimized yang ikut dikirim tetap
+                # tersimpan di atas.
+                if not _sys_autostart_set(bool(body.get("start_on_login")), bool(saved.get("start_minimized", True))):
+                    self._send(json.dumps({"ok": False, "error": "autostart_unavailable"}, ensure_ascii=False).encode("utf-8"), "application/json")
+                else:
+                    self._send(json.dumps(_sys_settings_state(), ensure_ascii=False).encode("utf-8"), "application/json")
+            else:
+                # start_minimized berubah sementara login AKTIF: tulis ulang
+                # entri Run dengan flag --tray yang baru supaya sinkron.
+                if "start_minimized" in body and _sys_autostart_get():
+                    _sys_autostart_set(True, bool(saved.get("start_minimized", True)))
+                self._send(json.dumps(_sys_settings_state(), ensure_ascii=False).encode("utf-8"), "application/json")
+        elif self.path == "/api/power":
+
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -4997,7 +5784,7 @@ class Handler(BaseHTTPRequestHandler):
                         if dims:
                             try:
                                 ffprobe = shutil.which("ffprobe") or os.path.join(os.path.dirname(ffmpeg), "ffprobe")
-                                pr = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                                pr = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                                 _wh = pr.stdout.decode("utf-8", "ignore").strip().split(",")
                                 if int(_wh[0]) <= dims[0] and int(_wh[1]) <= dims[1]:
                                     passthrough = True
@@ -5022,14 +5809,14 @@ class Handler(BaseHTTPRequestHandler):
                                 err_path = os.path.join(tmpdir, "stderr.txt")
                                 dur = 0.0
                                 try:
-                                    _prd = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                                    _prd = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                                     dur = float((_prd.stdout or b"").decode("utf-8", "ignore").strip() or 0)
                                 except Exception:
                                     dur = 0.0
                                 # perc177: coba hardware encoder AMD AMF (RX 6600) dulu.
                                 amf_ok = False
                                 try:
-                                    enc = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                                    enc = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                                     amf_ok = b"h264_amf" in (enc.stdout or b"")
                                 except Exception:
                                     amf_ok = False
@@ -5055,7 +5842,7 @@ class Handler(BaseHTTPRequestHandler):
                                 _bg_comp_job_set(job, phase="encode", pct=0, engine="photo", speed_mb=0, speed_x=0, eta_s=None)
                                 cmd = [ffmpeg, "-y", "-i", in_path, "-vf", vf, "-q:v", "3", out_path]
                                 ctype = "image/jpeg"
-                                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200)
+                                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                                 if proc.returncode != 0 or not os.path.exists(out_path):
                                     _bg_comp_job_set(job, phase="error", pct=100, engine="", error="ffmpeg_failed")
                                     self.send_response(500)
@@ -5088,25 +5875,49 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not found")
 
 
+def _warmup_bg():
+    """Warm-up collect() di latar (perc206): isi cache penuh tanpa memblokir
+    listener — collect() sendiri sudah SWR (snapshot cepat + refresh latar),
+    jadi panggilan ini kembali cepat."""
+    try:
+        collect()
+    except Exception:
+        pass
+
+
+def _autostart_early_bg():
+    """Auto-start LHM/Afterburner lebih awal (perc206): beri dashboard
+    ~2 detik untuk mengirim ultralite=1 bila Mode Super Ringan aktif,
+    lalu jalankan _maybe_autostart() (tetap hormat opt-out perc154:
+    bila _ULTRA_MODE True saat itu, auto-start tidak jalan; pemicu malas
+    di /api/data tetap berlaku bila mode berubah jadi normal)."""
+    try:
+        time.sleep(2.0)
+    except Exception:
+        pass
+    try:
+        _maybe_autostart()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     psutil.cpu_percent(interval=0.1)
-    collect()
     try:
-        import threading
         threading.Thread(target=_power_thread, daemon=True).start()
     except Exception:
         pass
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     fw_ok = _ensure_firewall_rule()
-    # perc154: auto-start LHM/Afterburner TIDAK lagi di sini, tapi malas
-    # (lazy) saat request /api/data pertama yang BUKAN Mode Super Ringan
-    # (_maybe_autostart). Jadi PC super ringan tidak dibebani aplikasi berat.
+    # perc154 + perc206: auto-start LHM/Afterburner TIDAK lagi malas
+    # menunggu /api/data pertama — dimulai lebih awal di thread latar
+    # (_autostart_early_bg), tetap hormat Mode Super Ringan.
     qr_url = _dashboard_qr()
     print("=" * 60)
     print("KISA jalan!")
     print("Buka di HP (satu WiFi yang sama ATAU hotspot HP) salah satu alamat ini:")
     for ip in _local_ips() or ["<IP-PC-kamu>"]:
-        tag = " (kemungkinan hotspot HP)" if (ip.startswith("192.168.43.") or ip.startswith("172.20.10.")) else ""
+        tag = " (kemungkinan hotspot HP)" if (ip.startswith("192.168.43.") or ip.startswith("192.168.49.") or ip.startswith("172.20.10.") or ip.startswith("10.")) else ""
         print(f"  http://{ip}:{PORT}{tag}")
     if qr_url:
         print(f"QR dashboard: {qr_url}  (file QR_Dashboard.png — scan dari HP)")
@@ -5116,13 +5927,34 @@ if __name__ == "__main__":
         print("Firewall: port 8000 BELUM tentu diizinkan. Kalau HP tidak bisa membuka,")
         print("  tutup server ini, klik kanan Jalankan_di_PC.bat > Run as administrator,")
         print("  lalu jalankan lagi sekali.")
-    print("Auto-start Afterburner/LHM: aktif saat dashboard pertama dibuka")
+    print("Auto-start Afterburner/LHM: aktif saat server mulai (thread latar)")
     print("  (bukan Mode Super Ringan); tidak dinyalakan bila Mode Super Ringan.")
     print("  Status auto-start bisa dicek di http://localhost:8000/api/fps_debug")
     print(f"Di PC ini juga bisa dibuka: http://localhost:{PORT}")
     print("Berhenti: tekan Ctrl+C di jendela ini.")
     print("=" * 60)
+    # Patch 5.1 (perc206): warm-up + auto-start jalan di thread latar DULU,
+    # baru serve_forever di thread utama — listener langsung mendengarkan
+    # begitu serve_forever dipanggil, jadi warm-up collect() yang dingin
+    # tidak memblokir koneksi dashboard ("Menghubungkan ke PC..." ~15 detik
+    # sebelumnya karena collect() jalan sebelum server dibuat). serve_forever
+    # SENGAJA di thread utama (bukan join-loop): Thread.join(timeout) tidak
+    # terinterupsi SIGINT di Python 3.12, sedangkan serve_forever di thread
+    # utama membuat Ctrl+C tetap bekerja seperti dulu.
+    try:
+        threading.Thread(target=_warmup_bg, daemon=True, name="kisa-warmup").start()
+    except Exception:
+        pass
+    try:
+        threading.Thread(target=_autostart_early_bg, daemon=True, name="kisa-autostart").start()
+    except Exception:
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nServer dihentikan.")
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
