@@ -321,7 +321,6 @@ begin
   St.Width := Pill.Width;
   St.Height := ScaleY(14);
   St.Alignment := taCenter;
-  St.Transparent := True;
   St.Font.Color := clGray;
   St.Caption := 'Memeriksa...';
   SupportStatus[Index] := St;
