@@ -25,8 +25,8 @@ android {
         applicationId "com.kirisaki.kisa"
         minSdk 24
         targetSdk 34
-        versionCode 17
-        versionName "5.1"
+        versionCode 19
+        versionName "5.3"
     }
 
     signingConfigs {
