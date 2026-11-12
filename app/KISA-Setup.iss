@@ -1,8 +1,8 @@
-; KISA-Setup.iss — Installer KISA (Patch 5.1) untuk Inno Setup 6.
+; KISA-Setup.iss — Installer KISA (Patch 5.3) untuk Inno Setup 6.
 ; Dijalankan SETELAH PyInstaller membuat dist\KISA.exe:
 ;     pyinstaller app\KISA.spec
 ;     iscc app\KISA-Setup.iss
-; Hasil: dist-installer\KISA-Setup-5.1.exe
+; Hasil: dist-installer\KISA-Setup-5.3.exe
 ;
 ; Catatan:
 ; - KISA.exe (onefile) sudah berisi Python + server + dashboard; installer
@@ -14,7 +14,7 @@
 ; - Auto-start Windows diatur aplikasi sendiri (tray menu / --install-autostart).
 
 #define MyAppName "KISA"
-#define MyAppVersion "5.1"
+#define MyAppVersion "5.3"
 #define MyAppPublisher "kirisaki"
 #define MyAppExeName "KISA.exe"
 
@@ -337,7 +337,7 @@ var
 begin
   SupportPage := CreateCustomPage(wpSelectTasks, 'Aplikasi Pendukung',
     'Pilih aplikasi pendukung yang mau di-install agar semua fitur KISA jalan.');
-  { Header S193: logo "K" biru + nama KISA + badge Patch 5.1 }
+  { Header S193: logo "K" biru + nama KISA + badge Patch 5.3 }
   Logo := TPanel.Create(SupportPage);
   Logo.Parent := SupportPage.Surface;
   Logo.Left := ScaleX(8);
@@ -378,7 +378,7 @@ begin
   Badge.Font.Color := clWhite;
   Badge.Font.Style := [fsBold];
   Badge.Font.Size := 8;
-  Badge.Caption := 'Patch 5.1';
+  Badge.Caption := 'Patch 5.3';
   Badge.Alignment := taCenter;
   Badge.BevelOuter := bvNone;
   Intro := TNewStaticText.Create(SupportPage);
