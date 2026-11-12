@@ -1,7 +1,7 @@
 # Build KISA Apps — .exe Windows + .apk Android (S138 Cara 3)
 #
-# Berjalan saat tag v* di-push (mis. v5.1) atau dijalankan manual.
-# Hasil: KISA.exe + KISA-Setup-5.1.exe (Windows) dan KISA-5.1.apk (Android)
+# Berjalan saat tag v* di-push (mis. v5.3) atau dijalankan manual.
+# Hasil: KISA.exe + KISA-Setup-5.3.exe (Windows) dan KISA-5.3.apk (Android)
 # di tab Artifacts setiap job.
 #
 # Catatan jujur:
@@ -58,19 +58,19 @@ jobs:
       - name: Build installer (Inno Setup)
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" app\KISA-Setup.iss
-          if (-not (Test-Path "dist-installer/KISA-Setup-5.1.exe")) { throw "Installer tidak ditemukan" }
+          if (-not (Test-Path "dist-installer/KISA-Setup-5.3.exe")) { throw "Installer tidak ditemukan" }
 
       - name: Upload KISA.exe
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-exe-5.1
+          name: KISA-exe-5.3
           path: dist/KISA.exe
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-Setup-5.1
-          path: dist-installer/KISA-Setup-5.1.exe
+          name: KISA-Setup-5.3
+          path: dist-installer/KISA-Setup-5.3.exe
 
   build-android:
     name: "Android: KISA.apk (WebView)"
@@ -116,13 +116,13 @@ jobs:
           ls -la app/android/app/build/outputs/apk/release/
           test -f app/android/app/build/outputs/apk/release/app-release.apk
 
-      - name: Rename APK (KISA-5.1.apk)
+      - name: Rename APK (KISA-5.3.apk)
         run: |
-          mv app/android/app/build/outputs/apk/release/app-release.apk app/android/app/build/outputs/apk/release/KISA-5.1.apk
+          mv app/android/app/build/outputs/apk/release/app-release.apk app/android/app/build/outputs/apk/release/KISA-5.3.apk
           ls -la app/android/app/build/outputs/apk/release/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: KISA-apk-5.1
-          path: app/android/app/build/outputs/apk/release/KISA-5.1.apk
+          name: KISA-apk-5.3
+          path: app/android/app/build/outputs/apk/release/KISA-5.3.apk
