@@ -51,7 +51,7 @@ PORT = 8000
 # Patch 4.6 (S157 Cara 1): versi dashboard yang terpasang — dipakai
 # /api/check_update untuk membandingkan dengan rilis GitHub terbaru.
 # Naikkan tiap patch (bersamaan dengan footer dashboard).
-KISA_VERSION = "5.1"
+KISA_VERSION = "5.3"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WIN = platform.system() == "Windows"
 
